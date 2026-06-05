@@ -33,6 +33,10 @@ API_HASH = "3fa32264398920f001dd2428b42060f6"
 BOT_TOKEN = "8740807130:AAEXt1_6ynUsMkJZWqH112iV07g6agTMbMA"
 ADMIN_ID = 8002472821
 
+# Канал, на который должен быть подписан пользователь, чтобы пользоваться парсером.
+REQUIRED_CHANNEL = "@fcklole"
+REQUIRED_CHANNEL_URL = "https://t.me/fcklole"
+
 # ==========================
 # НАСТРОЙКИ
 # ==========================
@@ -124,6 +128,71 @@ def is_admin_user(user_id: Optional[int]) -> bool:
     return user_id == ADMIN_ID
 
 
+def subscription_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📢 Подписаться на канал",
+                    url=REQUIRED_CHANNEL_URL,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✅ Проверить подписку",
+                    callback_data="check_subscription",
+                )
+            ],
+        ]
+    )
+
+
+async def is_user_subscribed(user_id: Optional[int]) -> bool:
+    if user_id is None:
+        return False
+
+    # Админ всегда имеет доступ, чтобы мог добавить сессию и управлять ботом.
+    if is_admin_user(user_id):
+        return True
+
+    try:
+        member = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL, user_id=user_id)
+        raw_status = getattr(member, "status", "")
+        status = str(getattr(raw_status, "value", raw_status)).lower()
+        return status not in {"left", "kicked"}
+    except Exception as e:
+        log.warning("Could not check channel subscription for user %s: %s", user_id, e)
+        return False
+
+
+async def send_subscription_required_message(message_or_callback_message):
+    await message_or_callback_message.answer(
+        "Чтобы пользоваться парсером, сначала подпишись на канал:\n"
+        f"{REQUIRED_CHANNEL_URL}\n\n"
+        "После подписки нажми кнопку «✅ Проверить подписку».",
+        reply_markup=subscription_keyboard(),
+    )
+
+
+async def ensure_access_for_message(message: Message) -> bool:
+    user_id = message.from_user.id if message.from_user else None
+
+    if await is_user_subscribed(user_id):
+        return True
+
+    await send_subscription_required_message(message)
+    return False
+
+
+async def ensure_access_for_callback(callback: CallbackQuery) -> bool:
+    user_id = callback.from_user.id if callback.from_user else None
+
+    if await is_user_subscribed(user_id):
+        return True
+
+    await callback.answer("Сначала подпишись на канал", show_alert=True)
+    await send_subscription_required_message(callback.message)
+    return False
 
 
 # ==========================
@@ -174,14 +243,21 @@ async def is_user_client_authorized() -> bool:
     return bool(await user_client.is_user_authorized())
 
 
-async def send_session_required_message(message_or_callback_message):
+async def send_session_required_message(message_or_callback_message, user_id: Optional[int] = None):
+    if is_admin_user(user_id):
+        await message_or_callback_message.answer(
+            "Сессия Telegram ещё не добавлена.\n\n"
+            "Нажми кнопку ниже, введи номер телефона, потом код из Telegram. "
+            "Код можно отправить через #, например:\n"
+            "<code>1#2#3#4#5</code>",
+            reply_markup=session_required_keyboard(),
+            parse_mode="HTML",
+        )
+        return
+
     await message_or_callback_message.answer(
-        "Сессия Telegram ещё не добавлена.\n\n"
-        "Нажми кнопку ниже, введи номер телефона, потом код из Telegram. "
-        "Код можно отправить через #, например:\n"
-        "<code>1#2#3#4#5</code>",
-        reply_markup=session_required_keyboard(),
-        parse_mode="HTML",
+        "Парсер пока не подключён к Telegram-сессии. "
+        "Админ должен один раз добавить сессию через /start."
     )
 
 
@@ -189,7 +265,8 @@ async def ensure_session_for_message(message: Message) -> bool:
     if await is_user_client_authorized():
         return True
 
-    await send_session_required_message(message)
+    user_id = message.from_user.id if message.from_user else None
+    await send_session_required_message(message, user_id)
     return False
 
 
@@ -197,12 +274,22 @@ async def ensure_session_for_callback(callback: CallbackQuery) -> bool:
     if await is_user_client_authorized():
         return True
 
-    await callback.answer("Сначала добавь сессию", show_alert=True)
-    await callback.message.answer(
-        "Сессия Telegram ещё не добавлена.\n\n"
-        "Добавь её через чат с ботом, чтобы парсер мог работать.",
-        reply_markup=session_required_keyboard(),
-    )
+    user_id = callback.from_user.id if callback.from_user else None
+
+    if is_admin_user(user_id):
+        await callback.answer("Сначала добавь сессию", show_alert=True)
+        await callback.message.answer(
+            "Сессия Telegram ещё не добавлена.\n\n"
+            "Добавь её через чат с ботом, чтобы парсер мог работать.",
+            reply_markup=session_required_keyboard(),
+        )
+    else:
+        await callback.answer("Парсер пока не настроен админом", show_alert=True)
+        await callback.message.answer(
+            "Парсер пока не подключён к Telegram-сессии. "
+            "Админ должен один раз добавить сессию."
+        )
+
     return False
 
 
@@ -701,29 +788,37 @@ def make_button_rows(buttons: List[InlineKeyboardButton], row_size: int = 1):
     return rows
 
 
-def main_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📦 Выбрать модель подарка",
-                    callback_data="models:0",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🚫 Чёрный список владельцев",
-                    callback_data="owners_blacklist",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔄 Обновить модели",
-                    callback_data="refresh_models",
-                )
-            ],
+def main_menu_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="📦 Выбрать модель подарка",
+                callback_data="models:0",
+            )
         ]
-    )
+    ]
+
+    # Админские кнопки показываем только админу.
+    # Обычные пользователи после подписки получают только поиск.
+    if user_id is None or is_admin_user(user_id):
+        rows.extend(
+            [
+                [
+                    InlineKeyboardButton(
+                        text="🚫 Чёрный список владельцев",
+                        callback_data="owners_blacklist",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🔄 Обновить модели",
+                        callback_data="refresh_models",
+                    )
+                ],
+            ]
+        )
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def models_keyboard(page: int = 0) -> InlineKeyboardMarkup:
@@ -790,7 +885,10 @@ def models_keyboard(page: int = 0) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def search_results_keyboard(results: List[MarketGift]) -> InlineKeyboardMarkup:
+def search_results_keyboard(
+    results: List[MarketGift],
+    user_id: Optional[int] = None,
+) -> InlineKeyboardMarkup:
     rows = []
 
     rows.append(
@@ -811,31 +909,34 @@ def search_results_keyboard(results: List[MarketGift]) -> InlineKeyboardMarkup:
         ]
     )
 
-    for i, gift in enumerate(results, 1):
-        if gift.owner.key:
-            owner_text = gift.owner.display
-            text = f"🚫 Забанить владельца #{i}"
+    # Бан владельцев и чёрный список оставляем только админу,
+    # чтобы обычные пользователи не могли менять общий фильтр парсера.
+    if user_id is None or is_admin_user(user_id):
+        for i, gift in enumerate(results, 1):
+            if gift.owner.key:
+                owner_text = gift.owner.display
+                text = f"🚫 Забанить владельца #{i}"
 
-            if owner_text and owner_text != "не указан":
-                text += f" · {owner_text}"
+                if owner_text and owner_text != "не указан":
+                    text += f" · {owner_text}"
 
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        text=text[:64],
-                        callback_data=f"ban_owner:{i - 1}",
-                    )
-                ]
-            )
+                rows.append(
+                    [
+                        InlineKeyboardButton(
+                            text=text[:64],
+                            callback_data=f"ban_owner:{i - 1}",
+                        )
+                    ]
+                )
 
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text="🚫 Чёрный список",
-                callback_data="owners_blacklist",
-            )
-        ]
-    )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="🚫 Чёрный список",
+                    callback_data="owners_blacklist",
+                )
+            ]
+        )
 
     rows.append(
         [
@@ -1129,7 +1230,9 @@ def format_market_results(base_gift: BaseGift, results: List[MarketGift]) -> str
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    if not is_admin_user(message.from_user.id if message.from_user else None):
+    user_id = message.from_user.id if message.from_user else None
+
+    if not await ensure_access_for_message(message):
         return
 
     if not await ensure_session_for_message(message):
@@ -1142,10 +1245,40 @@ async def cmd_start(message: Message):
         "Нажми кнопку ниже, выбери модель подарка и введи диапазон цены.\n\n"
         "Пример диапазона:\n"
         "<code>500 800</code>",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(user_id),
         parse_mode="HTML",
     )
 
+
+@dp.callback_query(F.data == "check_subscription")
+async def cb_check_subscription(callback: CallbackQuery):
+    user_id = callback.from_user.id if callback.from_user else None
+
+    if not await is_user_subscribed(user_id):
+        await callback.answer("Подписка пока не найдена", show_alert=True)
+        await send_subscription_required_message(callback.message)
+        return
+
+    if not await ensure_session_for_callback(callback):
+        return
+
+    try:
+        await ensure_models_loaded()
+    except Exception as e:
+        log.exception("Could not load models after subscription check")
+        await callback.message.answer(
+            "Подписка подтверждена, но модели пока не загрузились.\n\n"
+            f"Ошибка:\n<code>{html.escape(type(e).__name__)}: {html.escape(str(e))}</code>",
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+
+    await callback.message.edit_text(
+        "✅ Подписка подтверждена. Теперь можно пользоваться парсером.",
+        reply_markup=main_menu_keyboard(user_id),
+    )
+    await callback.answer("Подписка подтверждена")
 
 
 @dp.callback_query(F.data == "auth_start")
@@ -1242,8 +1375,7 @@ async def cmd_blacklist(message: Message):
 
 @dp.callback_query(F.data == "menu")
 async def cb_menu(callback: CallbackQuery):
-    if not is_admin_user(callback.from_user.id):
-        await callback.answer()
+    if not await ensure_access_for_callback(callback):
         return
 
     if not await ensure_session_for_callback(callback):
@@ -1251,7 +1383,7 @@ async def cb_menu(callback: CallbackQuery):
 
     await callback.message.edit_text(
         "Главное меню.",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(callback.from_user.id),
     )
 
     await callback.answer()
@@ -1292,8 +1424,7 @@ async def cb_refresh_models(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("models:"))
 async def cb_models(callback: CallbackQuery):
-    if not is_admin_user(callback.from_user.id):
-        await callback.answer()
+    if not await ensure_access_for_callback(callback):
         return
 
     if not await ensure_session_for_callback(callback):
@@ -1309,7 +1440,7 @@ async def cb_models(callback: CallbackQuery):
     if not BASE_GIFTS:
         await callback.message.edit_text(
             "Модели с ресейлом не найдены. Попробуй /reload.",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=main_menu_keyboard(callback.from_user.id),
         )
         await callback.answer()
         return
@@ -1328,8 +1459,7 @@ async def cb_models(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("gift:"))
 async def cb_select_gift(callback: CallbackQuery):
-    if not is_admin_user(callback.from_user.id):
-        await callback.answer()
+    if not await ensure_access_for_callback(callback):
         return
 
     if not await ensure_session_for_callback(callback):
@@ -1348,7 +1478,7 @@ async def cb_select_gift(callback: CallbackQuery):
     if not gift:
         await callback.message.edit_text(
             "Эта модель не найдена в кэше. Нажми /reload и попробуй снова.",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=main_menu_keyboard(callback.from_user.id),
         )
         await callback.answer()
         return
@@ -1538,8 +1668,7 @@ async def cb_clear_owners_blacklist(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "repeat_search")
 async def cb_repeat_search(callback: CallbackQuery):
-    if not is_admin_user(callback.from_user.id):
-        await callback.answer()
+    if not await ensure_access_for_callback(callback):
         return
 
     if not await ensure_session_for_callback(callback):
@@ -1552,7 +1681,7 @@ async def cb_repeat_search(callback: CallbackQuery):
         await callback.answer("Нет прошлого поиска")
         await callback.message.answer(
             "Сначала выбери модель и введи диапазон.",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=main_menu_keyboard(user_id),
         )
         return
 
@@ -1566,7 +1695,7 @@ async def cb_repeat_search(callback: CallbackQuery):
         await callback.answer("Модель не найдена")
         await callback.message.answer(
             "Модель потерялась из кэша. Нажми /reload и выбери заново.",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=main_menu_keyboard(user_id),
         )
         return
 
@@ -1601,7 +1730,7 @@ async def cb_repeat_search(callback: CallbackQuery):
                 f"в диапазоне <b>{min_stars}-{max_stars}</b> ⭐.\n\n"
                 f"Можно сбросить историю показанных ссылок и начать заново.",
                 parse_mode="HTML",
-                reply_markup=search_results_keyboard([]),
+                reply_markup=search_results_keyboard([], user_id),
             )
             return
 
@@ -1611,7 +1740,7 @@ async def cb_repeat_search(callback: CallbackQuery):
             answer,
             parse_mode="HTML",
             disable_web_page_preview=True,
-            reply_markup=search_results_keyboard(results),
+            reply_markup=search_results_keyboard(results, user_id),
         )
 
     except Exception as e:
@@ -1621,14 +1750,13 @@ async def cb_repeat_search(callback: CallbackQuery):
             "Ошибка повторного поиска.\n\n"
             f"<code>{html.escape(type(e).__name__)}: {html.escape(str(e))}</code>",
             parse_mode="HTML",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=main_menu_keyboard(user_id),
         )
 
 
 @dp.callback_query(F.data == "clear_seen_current")
 async def cb_clear_seen_current(callback: CallbackQuery):
-    if not is_admin_user(callback.from_user.id):
-        await callback.answer()
+    if not await ensure_access_for_callback(callback):
         return
 
     user_id = callback.from_user.id
@@ -1649,7 +1777,7 @@ async def cb_clear_seen_current(callback: CallbackQuery):
     await callback.message.answer(
         "🧹 Сбросил показанные ссылки для текущей модели и диапазона.\n"
         "Теперь можно снова искать с начала.",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(user_id),
     )
 
 
@@ -1659,13 +1787,17 @@ async def cb_clear_seen_current(callback: CallbackQuery):
 
 @dp.message()
 async def handle_price_range(message: Message):
-    if not is_admin_user(message.from_user.id if message.from_user else None):
+    if not message.from_user:
         return
 
     user_id = message.from_user.id
 
-    if user_id in AUTH_STATES_BY_USER:
+    # Ввод номера/кода/2FA для Telethon разрешён только админу.
+    if is_admin_user(user_id) and user_id in AUTH_STATES_BY_USER:
         await handle_auth_message(message)
+        return
+
+    if not await ensure_access_for_message(message):
         return
 
     if not await ensure_session_for_message(message):
@@ -1674,7 +1806,7 @@ async def handle_price_range(message: Message):
     if user_id not in USER_SELECTED_GIFT:
         await message.answer(
             "Сначала выбери модель подарка.",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=main_menu_keyboard(user_id),
         )
         return
 
@@ -1717,7 +1849,7 @@ async def handle_price_range(message: Message):
     if not base_gift:
         await message.answer(
             "Модель потерялась из кэша. Нажми /reload и выбери заново.",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=main_menu_keyboard(user_id),
         )
         return
 
@@ -1756,7 +1888,7 @@ async def handle_price_range(message: Message):
             answer,
             parse_mode="HTML",
             disable_web_page_preview=True,
-            reply_markup=search_results_keyboard(results),
+            reply_markup=search_results_keyboard(results, user_id),
         )
 
     except Exception as e:
@@ -1767,7 +1899,7 @@ async def handle_price_range(message: Message):
             f"<code>{html.escape(type(e).__name__)}: {html.escape(str(e))}</code>\n\n"
             "Скинь мне этот лог, я подправлю код под твою структуру ответа.",
             parse_mode="HTML",
-            reply_markup=main_menu_keyboard(),
+            reply_markup=main_menu_keyboard(user_id),
         )
 
 
