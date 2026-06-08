@@ -11,6 +11,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
 from telethon import TelegramClient
 from telethon.errors import (
     FloodWaitError,
