@@ -11,6 +11,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
 from telethon import TelegramClient
 from telethon.errors import (
     FloodWaitError,
@@ -23,7 +26,7 @@ from telethon.errors import (
 from telethon.tl import functions
 
 # ==========================
-# НАСТРОЙКИ
+# НАСТРОЙКИ (ВПИШИ СВОИ ДАННЫЕ)
 # ==========================
 
 API_ID = 26259835
@@ -31,14 +34,14 @@ API_HASH = "3fa32264398920f001dd2428b42060f6"
 BOT_TOKEN = "8740807130:AAEXt1_6ynUsMkJZWqH112iV07g6agTMbMA"
 ADMIN_ID = 8002472821
 
-# Канал для подписки
+# Канал, на который должен быть подписан пользователь
 REQUIRED_CHANNEL = "@fcklole"
 REQUIRED_CHANNEL_URL = "https://t.me/fcklole"
 
-# ID группы для мониторинга (если не нужен - оставь None)
+# ID группы для мониторинга (можно оставить None если не нужен)
 MONITOR_CHAT_ID = -1004223195405
 
-# Интервал проверки
+# Интервал проверки мониторинга (секунды)
 MONITOR_INTERVAL = 60
 
 # ==========================
@@ -65,7 +68,7 @@ logging.basicConfig(
 log = logging.getLogger("nft-gift-bot")
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 
 user_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
@@ -85,7 +88,7 @@ AUTH_STATES_BY_USER: Dict[int, Dict[str, Any]] = {}
 monitor_running = False
 monitor_task = None
 
-# Настройки
+# Настройки отправки
 bot_settings = {
     "links_per_message": 10,
     "delay_between_batches": 30,
@@ -245,8 +248,24 @@ async def check_sub(callback: CallbackQuery):
 
 
 # ==========================
-# АВТОРИЗАЦИЯ
+# АВТОРИЗАЦИЯ TELETHON
 # ==========================
+
+def normalize_login_code(text: str) -> str:
+    return "".join(ch for ch in text if ch.isdigit())
+
+
+def session_required_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔐 Добавить / обновить сессию", callback_data="auth_start")]]
+    )
+
+
+def auth_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="auth_cancel")]]
+    )
+
 
 async def ensure_user_client_connected():
     if not user_client.is_connected():
@@ -255,7 +274,324 @@ async def ensure_user_client_connected():
 
 async def is_user_client_authorized() -> bool:
     await ensure_user_client_connected()
-    return await user_client.is_user_authorized()
+    return bool(await user_client.is_user_authorized())
+
+
+async def send_session_required_message(message_or_callback_message, user_id: Optional[int] = None):
+    if is_admin_user(user_id):
+        await message_or_callback_message.answer(
+            "Сессия Telegram ещё не добавлена.\n\n"
+            "Нажми кнопку ниже, введи номер телефона, потом код из Telegram. "
+            "Код можно отправить через #, например:\n"
+            "<code>1#2#3#4#5</code>",
+            reply_markup=session_required_keyboard(),
+            parse_mode="HTML",
+        )
+        return
+    await message_or_callback_message.answer(
+        "Парсер пока не подключён к Telegram-сессии. Админ должен один раз добавить сессию через /start."
+    )
+
+
+async def ensure_session_for_message(message: Message) -> bool:
+    if await is_user_client_authorized():
+        return True
+    user_id = message.from_user.id if message.from_user else None
+    await send_session_required_message(message, user_id)
+    return False
+
+
+async def ensure_session_for_callback(callback: CallbackQuery) -> bool:
+    if await is_user_client_authorized():
+        return True
+    user_id = callback.from_user.id if callback.from_user else None
+    if is_admin_user(user_id):
+        await callback.answer("Сначала добавь сессию", show_alert=True)
+        await callback.message.answer(
+            "Сессия Telegram ещё не добавлена.\n\nДобавь её через чат с ботом, чтобы парсер мог работать.",
+            reply_markup=session_required_keyboard(),
+        )
+    else:
+        await callback.answer("Парсер пока не настроен админом", show_alert=True)
+        await callback.message.answer(
+            "Парсер пока не подключён к Telegram-сессии. Админ должен один раз добавить сессию."
+        )
+    return False
+
+
+async def finish_successful_auth(message: Message):
+    user_id = message.from_user.id
+    AUTH_STATES_BY_USER.pop(user_id, None)
+    me = await user_client.get_me()
+    shown_name = html.escape(
+        str(
+            getattr(me, "first_name", None)
+            or getattr(me, "username", None)
+            or getattr(me, "id", "аккаунт")
+        )
+    )
+    await message.answer(
+        f"✅ Сессия добавлена. Telethon вошёл как: <b>{shown_name}</b>\n\n"
+        f"Загружаю модели подарков...",
+        parse_mode="HTML",
+    )
+    global BASE_GIFTS, BASE_GIFTS_BY_ID
+    try:
+        BASE_GIFTS = await load_base_gifts()
+        BASE_GIFTS_BY_ID = {gift.gift_id: gift for gift in BASE_GIFTS}
+        await message.answer(
+            f"Готово. Загружено моделей с ресейлом: <b>{len(BASE_GIFTS)}</b>",
+            reply_markup=main_menu_keyboard(user_id),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        log.exception("Could not load models after auth")
+        await message.answer(
+            "Сессия добавлена, но модели пока не загрузились.\n\n"
+            f"Ошибка:\n<code>{html.escape(type(e).__name__)}: {html.escape(str(e))}</code>\n\n"
+            "Попробуй нажать /reload.",
+            reply_markup=main_menu_keyboard(user_id),
+            parse_mode="HTML",
+        )
+
+
+async def handle_auth_message(message: Message):
+    user_id = message.from_user.id
+    state = AUTH_STATES_BY_USER.get(user_id)
+    if not state:
+        return
+    text = (message.text or "").strip()
+    step = state.get("step")
+    if step == "phone":
+        phone = text.replace(" ", "")
+        if not phone.startswith("+") or len(phone) < 8:
+            await message.answer(
+                "Отправь номер телефона в международном формате.\n\nПример:\n<code>+79991234567</code>",
+                parse_mode="HTML",
+                reply_markup=auth_cancel_keyboard(),
+            )
+            return
+        try:
+            await ensure_user_client_connected()
+            await user_client.send_code_request(phone)
+        except PhoneNumberInvalidError:
+            await message.answer(
+                "Telegram не принял этот номер. Проверь формат и отправь ещё раз.",
+                reply_markup=auth_cancel_keyboard(),
+            )
+            return
+        except FloodWaitError as e:
+            await message.answer(
+                f"Telegram просит подождать <b>{int(e.seconds)}</b> сек. перед новой попыткой.",
+                parse_mode="HTML",
+                reply_markup=auth_cancel_keyboard(),
+            )
+            return
+        except Exception as e:
+            log.exception("send_code_request error")
+            await message.answer(
+                "Не смог отправить код.\n\n"
+                f"<code>{html.escape(type(e).__name__)}: {html.escape(str(e))}</code>",
+                parse_mode="HTML",
+                reply_markup=auth_cancel_keyboard(),
+            )
+            return
+        AUTH_STATES_BY_USER[user_id] = {"step": "code", "phone": phone}
+        await message.answer(
+            "Код отправлен в Telegram.\n\n"
+            "Отправь его одним сообщением. Можно через #, например:\n"
+            "<code>1#2#3#4#5</code>",
+            parse_mode="HTML",
+            reply_markup=auth_cancel_keyboard(),
+        )
+        return
+    if step == "code":
+        phone = state.get("phone")
+        code = normalize_login_code(text)
+        if len(code) < 4:
+            await message.answer(
+                "Код слишком короткий. Отправь код из Telegram, например:\n<code>1#2#3#4#5</code>",
+                parse_mode="HTML",
+                reply_markup=auth_cancel_keyboard(),
+            )
+            return
+        try:
+            await ensure_user_client_connected()
+            await user_client.sign_in(phone=phone, code=code)
+        except SessionPasswordNeededError:
+            AUTH_STATES_BY_USER[user_id] = {"step": "password", "phone": phone}
+            await message.answer(
+                "На аккаунте включена облачная 2FA.\n\nОтправь пароль от двухэтапной проверки одним сообщением.",
+                reply_markup=auth_cancel_keyboard(),
+            )
+            return
+        except PhoneCodeInvalidError:
+            await message.answer(
+                "Код неверный. Отправь код ещё раз.\n\nФормат через # тоже подходит: <code>1#2#3#4#5</code>",
+                parse_mode="HTML",
+                reply_markup=auth_cancel_keyboard(),
+            )
+            return
+        except PhoneCodeExpiredError:
+            AUTH_STATES_BY_USER[user_id] = {"step": "phone"}
+            await message.answer(
+                "Код истёк. Отправь номер телефона ещё раз, я запрошу новый код.",
+                reply_markup=auth_cancel_keyboard(),
+            )
+            return
+        except FloodWaitError as e:
+            await message.answer(
+                f"Telegram просит подождать <b>{int(e.seconds)}</b> сек. перед новой попыткой.",
+                parse_mode="HTML",
+                reply_markup=auth_cancel_keyboard(),
+            )
+            return
+        except Exception as e:
+            log.exception("sign_in by code error")
+            await message.answer(
+                "Не смог войти по коду.\n\n"
+                f"<code>{html.escape(type(e).__name__)}: {html.escape(str(e))}</code>",
+                parse_mode="HTML",
+                reply_markup=auth_cancel_keyboard(),
+            )
+            return
+        await finish_successful_auth(message)
+        return
+    if step == "password":
+        try:
+            await ensure_user_client_connected()
+            await user_client.sign_in(password=text)
+        except PasswordHashInvalidError:
+            await message.answer(
+                "Пароль 2FA неверный. Отправь пароль ещё раз.",
+                reply_markup=auth_cancel_keyboard(),
+            )
+            return
+        except FloodWaitError as e:
+            await message.answer(
+                f"Telegram просит подождать <b>{int(e.seconds)}</b> сек. перед новой попыткой.",
+                parse_mode="HTML",
+                reply_markup=auth_cancel_keyboard(),
+            )
+            return
+        except Exception as e:
+            log.exception("sign_in by password error")
+            await message.answer(
+                "Не смог войти по 2FA-паролю.\n\n"
+                f"<code>{html.escape(type(e).__name__)}: {html.escape(str(e))}</code>",
+                parse_mode="HTML",
+                reply_markup=auth_cancel_keyboard(),
+            )
+            return
+        await finish_successful_auth(message)
+        return
+    AUTH_STATES_BY_USER.pop(user_id, None)
+    await message.answer("Авторизация сброшена. Нажми /start и попробуй снова.")
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value) if value is not None else default
+    except:
+        return default
+
+
+def get_field(obj: Any, name: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def extract_stars_amount(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, list):
+        for item in value:
+            amt = extract_stars_amount(item)
+            if amt:
+                return amt
+        return 0
+    amt = get_field(value, "amount")
+    if amt is not None:
+        return safe_int(amt)
+    stars = get_field(value, "stars")
+    if stars is not None:
+        return safe_int(stars)
+    return 0
+
+
+# ==========================
+# BLACKLIST ВЛАДЕЛЬЦЕВ
+# ==========================
+
+def is_owner_blacklisted(key: Optional[str]) -> bool:
+    return key in OWNERS_BLACKLIST if key else False
+
+
+# ==========================
+# ИСТОРИЯ ПОКАЗАННЫХ ПОДАРКОВ
+# ==========================
+
+def get_seen_slugs(gift_id: int, min_stars: int, max_stars: int) -> set:
+    key = f"{gift_id}:{min_stars}:{max_stars}"
+    return set(SEEN_GIFTS_BY_QUERY.get(key, []))
+
+
+def remember_seen_results(gift_id: int, min_stars: int, max_stars: int, results: List[MarketGift]):
+    key = f"{gift_id}:{min_stars}:{max_stars}"
+    old = set(SEEN_GIFTS_BY_QUERY.get(key, []))
+    for gift in results:
+        if gift.slug not in old:
+            SEEN_GIFTS_BY_QUERY.setdefault(key, []).append(gift.slug)
+    save_seen_gifts()
+
+
+def clear_seen_for_query(gift_id: int, min_stars: int, max_stars: int):
+    key = f"{gift_id}:{min_stars}:{max_stars}"
+    SEEN_GIFTS_BY_QUERY.pop(key, None)
+    save_seen_gifts()
+
+
+# ==========================
+# ВЛАДЕЛЬЦЫ
+# ==========================
+
+async def resolve_owner_info(raw_gift: Any) -> OwnerInfo:
+    owner_name = get_field(raw_gift, "owner_name")
+    owner_id = get_field(raw_gift, "owner_id")
+    
+    direct_username = get_field(raw_gift, "owner_username") or get_field(raw_gift, "username")
+    if direct_username:
+        username = str(direct_username).lstrip("@")
+        return OwnerInfo(
+            key=f"username:{username.lower()}",
+            label=f"@{username}",
+            username=username,
+            link=f"https://t.me/{username}"
+        )
+    
+    if owner_id is not None:
+        try:
+            entity = await user_client.get_entity(owner_id)
+            username = getattr(entity, "username", None)
+            if username:
+                return OwnerInfo(
+                    key=f"username:{username.lower()}",
+                    label=f"@{username}",
+                    username=username,
+                    link=f"https://t.me/{username}"
+                )
+            name = getattr(entity, "first_name", "") or getattr(entity, "title", "") or str(owner_id)
+            return OwnerInfo(key=f"id:{owner_id}", label=name[:30], username=None, link=None)
+        except:
+            pass
+    
+    label = str(owner_name) if owner_name else "не указан"
+    return OwnerInfo(key=owner_name, label=label, username=None, link=None)
 
 
 # ==========================
@@ -372,99 +708,6 @@ async def ensure_models_loaded():
 # ПОИСК
 # ==========================
 
-def safe_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value) if value is not None else default
-    except:
-        return default
-
-
-def get_field(obj: Any, name: str, default: Any = None) -> Any:
-    if obj is None:
-        return default
-    if isinstance(obj, dict):
-        return obj.get(name, default)
-    return getattr(obj, name, default)
-
-
-def extract_stars_amount(value: Any) -> int:
-    if value is None:
-        return 0
-    if isinstance(value, int):
-        return value
-    if isinstance(value, list):
-        for item in value:
-            amt = extract_stars_amount(item)
-            if amt:
-                return amt
-        return 0
-    amt = get_field(value, "amount")
-    if amt is not None:
-        return safe_int(amt)
-    stars = get_field(value, "stars")
-    if stars is not None:
-        return safe_int(stars)
-    return 0
-
-
-async def resolve_owner_info(raw_gift: Any) -> OwnerInfo:
-    owner_name = get_field(raw_gift, "owner_name")
-    owner_id = get_field(raw_gift, "owner_id")
-    
-    direct_username = get_field(raw_gift, "owner_username") or get_field(raw_gift, "username")
-    if direct_username:
-        username = str(direct_username).lstrip("@")
-        return OwnerInfo(
-            key=f"username:{username.lower()}",
-            label=f"@{username}",
-            username=username,
-            link=f"https://t.me/{username}"
-        )
-    
-    if owner_id is not None:
-        try:
-            entity = await user_client.get_entity(owner_id)
-            username = getattr(entity, "username", None)
-            if username:
-                return OwnerInfo(
-                    key=f"username:{username.lower()}",
-                    label=f"@{username}",
-                    username=username,
-                    link=f"https://t.me/{username}"
-                )
-            name = getattr(entity, "first_name", "") or getattr(entity, "title", "") or str(owner_id)
-            return OwnerInfo(key=f"id:{owner_id}", label=name[:30], username=None, link=None)
-        except:
-            pass
-    
-    label = str(owner_name) if owner_name else "не указан"
-    return OwnerInfo(key=owner_name, label=label, username=None, link=None)
-
-
-def is_owner_blacklisted(key: Optional[str]) -> bool:
-    return key in OWNERS_BLACKLIST if key else False
-
-
-def get_seen_slugs(gift_id: int, min_stars: int, max_stars: int) -> set:
-    key = f"{gift_id}:{min_stars}:{max_stars}"
-    return set(SEEN_GIFTS_BY_QUERY.get(key, []))
-
-
-def remember_seen_results(gift_id: int, min_stars: int, max_stars: int, results: List[MarketGift]):
-    key = f"{gift_id}:{min_stars}:{max_stars}"
-    old = set(SEEN_GIFTS_BY_QUERY.get(key, []))
-    for gift in results:
-        if gift.slug not in old:
-            SEEN_GIFTS_BY_QUERY.setdefault(key, []).append(gift.slug)
-    save_seen_gifts()
-
-
-def clear_seen_for_query(gift_id: int, min_stars: int, max_stars: int):
-    key = f"{gift_id}:{min_stars}:{max_stars}"
-    SEEN_GIFTS_BY_QUERY.pop(key, None)
-    save_seen_gifts()
-
-
 async def find_market_gifts(gift_id: int, min_stars: int, max_stars: int, need: int = SEARCH_RESULT_LIMIT, skip_slugs: set = None) -> List[MarketGift]:
     found = []
     skip_slugs = skip_slugs or set()
@@ -534,23 +777,18 @@ def format_gift_list(gifts: List[MarketGift]) -> str:
     return "\n\n".join(lines)
 
 
-async def send_search_results(message: Message, base: BaseGift, results: List[MarketGift], min_price: int,
-                              max_price: int):
+async def send_search_results(message: Message, base: BaseGift, results: List[MarketGift], min_price: int, max_price: int):
     if not results:
         await message.answer(f"❌ По модели {base.title} ничего не найдено в диапазоне {min_price}-{max_price} ⭐")
         return
-
-    text = f"🎁 {base.title} | {min_price}—{max_price} ⭐\n└ Найдено: {len(results)}\n\n"
-
-    for i, g in enumerate(results[:LINKS_PER_MESSAGE], 1):
-        num = f" #{g.num}" if g.num else ""
-        owner = f"@{g.owner.username}" if g.owner.username else g.owner.label
-        text += f"{i}. {g.title}{num}\n💰 Цена: {g.price} ⭐\n👤 Владелец: {owner}\n🔗 {g.link}\n\n"
-
+    
+    text = f"🎁 {base.title} | {min_price}—{max_price} ⭐\n└ Найдено: {len(results)}\n\n{format_gift_list(results[:LINKS_PER_MESSAGE])}"
+    
     if len(text) > 4000:
         text = text[:3950] + "\n\n..."
-
+    
     await message.answer(text, disable_web_page_preview=True, reply_markup=search_results_keyboard(results))
+
 
 # ==========================
 # МОНИТОРИНГ
@@ -583,9 +821,12 @@ async def monitor_worker():
                     bgifts = [g for g in new_gifts if g.title == base.title]
                     if bgifts:
                         text = f"🆕 *НОВЫЕ ПОДАРКИ* | {base.title}\n\n{format_gift_list(bgifts[:LINKS_PER_MESSAGE])}"
-                        await safe_send_message(MONITOR_CHAT_ID, text)
-                        save_sent_monitor_slugs(SENT_MONITOR_SLUGS)
+                        try:
+                            await bot.send_message(MONITOR_CHAT_ID, text, disable_web_page_preview=True)
+                        except Exception as e:
+                            log.error(f"Monitor send error: {e}")
                         await asyncio.sleep(random.uniform(2, 5))
+                        save_sent_monitor_slugs(SENT_MONITOR_SLUGS)
         except Exception as e:
             log.error(f"Monitor error: {e}")
         await asyncio.sleep(MONITOR_INTERVAL)
@@ -593,7 +834,7 @@ async def monitor_worker():
 
 async def safe_send_message(chat_id: int, text: str):
     try:
-        await bot.send_message(chat_id, text, parse_mode="Markdown", disable_web_page_preview=True)
+        await bot.send_message(chat_id, text, disable_web_page_preview=True)
         await asyncio.sleep(random.uniform(1, 2))
     except Exception as e:
         log.error(f"Send error: {e}")
@@ -608,7 +849,7 @@ async def cmd_start(message: Message):
     if not await ensure_access(message):
         return
     if not await is_user_client_authorized():
-        await message.answer("⏳ Сессия не добавлена. Добавь через админ-панель /admin")
+        await message.answer("⏳ Сессия не добавлена. Добавь через админ-панель")
         return
     await ensure_models_loaded()
     await message.answer(
@@ -798,6 +1039,69 @@ async def clear_blacklist(callback: CallbackQuery):
 
 
 # ==========================
+# АДМИН-ПАНЕЛЬ
+# ==========================
+
+@dp.callback_query(F.data == "auth_start")
+async def auth_start(callback: CallbackQuery):
+    if not is_admin_user(callback.from_user.id):
+        await callback.answer()
+        return
+    await ensure_user_client_connected()
+    if await is_user_client_authorized():
+        await callback.message.edit_text(
+            "Сессия уже добавлена. Можно пользоваться ботом.",
+            reply_markup=main_menu_keyboard(callback.from_user.id),
+        )
+        await callback.answer()
+        return
+    AUTH_STATES_BY_USER[callback.from_user.id] = {"step": "phone"}
+    await callback.message.edit_text(
+        "Отправь номер телефона аккаунта Telegram в международном формате.\n\nПример:\n<code>+79991234567</code>",
+        parse_mode="HTML",
+        reply_markup=auth_cancel_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "auth_cancel")
+async def auth_cancel(callback: CallbackQuery):
+    if not is_admin_user(callback.from_user.id):
+        await callback.answer()
+        return
+    AUTH_STATES_BY_USER.pop(callback.from_user.id, None)
+    if await is_user_client_authorized():
+        await callback.message.edit_text(
+            "Авторизация отменена. Текущая сессия активна.",
+            reply_markup=main_menu_keyboard(callback.from_user.id),
+        )
+    else:
+        await callback.message.edit_text(
+            "Авторизация отменена. Без сессии парсер не сможет искать подарки.",
+            reply_markup=session_required_keyboard(),
+        )
+    await callback.answer()
+
+
+@dp.message(Command("reload"))
+async def reload_models(message: Message):
+    if not is_admin_user(message.from_user.id if message.from_user else None):
+        return
+    global BASE_GIFTS, BASE_GIFTS_BY_ID
+    await message.answer("Обновляю список моделей...")
+    try:
+        BASE_GIFTS = await load_base_gifts()
+        BASE_GIFTS_BY_ID = {gift.gift_id: gift for gift in BASE_GIFTS}
+        await message.answer(
+            f"Готово. Загружено моделей с ресейлом: <b>{len(BASE_GIFTS)}</b>",
+            reply_markup=main_menu_keyboard(message.from_user.id),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await message.answer(f"Ошибка обновления: {e}")
+
+
+# ==========================
 # МОНИТОРИНГ (АДМИН)
 # ==========================
 
@@ -846,6 +1150,12 @@ async def monitor_reset(callback: CallbackQuery):
 @dp.callback_query(F.data == "monitor_status")
 async def monitor_status(callback: CallbackQuery):
     await callback.answer(f"Статус: {'Активен' if monitor_running else 'Остановлен'}")
+
+
+@dp.message(Command("cancel"))
+async def cancel_cmd(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("❌ Действие отменено")
 
 
 # ==========================
