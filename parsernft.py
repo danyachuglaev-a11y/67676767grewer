@@ -11,9 +11,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State
 from telethon import TelegramClient
 from telethon.errors import (
     FloodWaitError,
@@ -38,7 +35,7 @@ ADMIN_ID = 8002472821
 REQUIRED_CHANNEL = "@fcklole"
 REQUIRED_CHANNEL_URL = "https://t.me/fcklole"
 
-# ID группы для мониторинга (можно оставить None если не нужен)
+# ID группы для мониторинга (оставь None если не нужен)
 MONITOR_CHAT_ID = -1004223195405
 
 # Интервал проверки мониторинга (секунды)
@@ -68,7 +65,7 @@ logging.basicConfig(
 log = logging.getLogger("nft-gift-bot")
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
+dp = Dispatcher()
 
 user_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
@@ -662,7 +659,7 @@ def monitor_admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="▶️ ЗАПУСТИТЬ", callback_data="monitor_start")] if not monitor_running else [],
         [InlineKeyboardButton(text="⏹️ ОСТАНОВИТЬ", callback_data="monitor_stop")] if monitor_running else [],
         [InlineKeyboardButton(text="🔄 СБРОСИТЬ ИСТОРИЮ", callback_data="monitor_reset")],
-        [InlineKeyboardButton(text="🏠 ГЛАВНОЕ", callback_data="menu")]
+        [InlineKeyboardButton(text="🏠 ГЛАВНОЕ", callback_data="menu")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=[b for b in buttons if b])
 
@@ -708,30 +705,43 @@ async def ensure_models_loaded():
 # ПОИСК
 # ==========================
 
-async def find_market_gifts(gift_id: int, min_stars: int, max_stars: int, need: int = SEARCH_RESULT_LIMIT, skip_slugs: set = None) -> List[MarketGift]:
+async def find_market_gifts(
+    gift_id: int,
+    min_stars: int,
+    max_stars: int,
+    need: int = SEARCH_RESULT_LIMIT,
+    skip_slugs: set = None,
+) -> List[MarketGift]:
     found = []
     skip_slugs = skip_slugs or set()
     offset = ""
     pages = 0
-    
+
     while len(found) < need and pages < MAX_MARKET_PAGES:
         pages += 1
         try:
-            result = await user_client(functions.payments.GetResaleStarGiftsRequest(
-                gift_id=gift_id, offset=offset, limit=REQUEST_PAGE_LIMIT,
-                sort_by_price=True, sort_by_num=False, stars_only=True, for_craft=False
-            ))
+            result = await user_client(
+                functions.payments.GetResaleStarGiftsRequest(
+                    gift_id=gift_id,
+                    offset=offset,
+                    limit=REQUEST_PAGE_LIMIT,
+                    sort_by_price=True,
+                    sort_by_num=False,
+                    stars_only=True,
+                    for_craft=False,
+                )
+            )
         except FloodWaitError as e:
             await asyncio.sleep(e.seconds + 1)
             continue
         except Exception as e:
             log.error(f"Search error: {e}")
             break
-        
+
         gifts = getattr(result, "gifts", [])
         if not gifts:
             break
-        
+
         for raw in gifts:
             slug = get_field(raw, "slug")
             if not slug or slug in skip_slugs:
@@ -744,13 +754,15 @@ async def find_market_gifts(gift_id: int, min_stars: int, max_stars: int, need: 
             owner = await resolve_owner_info(raw)
             if is_owner_blacklisted(owner.key):
                 continue
-            found.append(MarketGift(
-                title=str(get_field(raw, "title") or "Gift"),
-                num=safe_int(get_field(raw, "num")),
-                slug=slug,
-                price=price,
-                owner=owner,
-            ))
+            found.append(
+                MarketGift(
+                    title=str(get_field(raw, "title") or "Gift"),
+                    num=safe_int(get_field(raw, "num")),
+                    slug=slug,
+                    price=price,
+                    owner=owner,
+                )
+            )
             if len(found) >= need:
                 return found
         offset = getattr(result, "next_offset", "")
@@ -777,16 +789,24 @@ def format_gift_list(gifts: List[MarketGift]) -> str:
     return "\n\n".join(lines)
 
 
-async def send_search_results(message: Message, base: BaseGift, results: List[MarketGift], min_price: int, max_price: int):
+async def send_search_results(
+    message: Message, base: BaseGift, results: List[MarketGift], min_price: int, max_price: int
+):
     if not results:
-        await message.answer(f"❌ По модели {base.title} ничего не найдено в диапазоне {min_price}-{max_price} ⭐")
+        await message.answer(
+            f"❌ По модели {base.title} ничего не найдено в диапазоне {min_price}-{max_price} ⭐"
+        )
         return
-    
-    text = f"🎁 {base.title} | {min_price}—{max_price} ⭐\n└ Найдено: {len(results)}\n\n{format_gift_list(results[:LINKS_PER_MESSAGE])}"
-    
+
+    text = (
+        f"🎁 {base.title} | {min_price}—{max_price} ⭐\n"
+        f"└ Найдено: {len(results)}\n\n"
+        f"{format_gift_list(results[:LINKS_PER_MESSAGE])}"
+    )
+
     if len(text) > 4000:
         text = text[:3950] + "\n\n..."
-    
+
     await message.answer(text, disable_web_page_preview=True, reply_markup=search_results_keyboard(results))
 
 
@@ -801,7 +821,7 @@ async def monitor_worker():
             if not await is_user_client_authorized() or not BASE_GIFTS:
                 await asyncio.sleep(MONITOR_INTERVAL)
                 continue
-            
+
             new_gifts = []
             for base in BASE_GIFTS[:15]:
                 results = await find_market_gifts(
@@ -809,13 +829,13 @@ async def monitor_worker():
                     base.resell_min_stars or 0,
                     base.resell_min_stars + 5000 if base.resell_min_stars else 10000,
                     need=5,
-                    skip_slugs=SENT_MONITOR_SLUGS
+                    skip_slugs=SENT_MONITOR_SLUGS,
                 )
                 for g in results:
                     if g.slug not in SENT_MONITOR_SLUGS:
                         new_gifts.append(g)
                         SENT_MONITOR_SLUGS.add(g.slug)
-            
+
             if new_gifts and MONITOR_CHAT_ID:
                 for base in BASE_GIFTS:
                     bgifts = [g for g in new_gifts if g.title == base.title]
@@ -859,7 +879,7 @@ async def cmd_start(message: Message):
         "📌 Пример цены: `500 800`\n"
         "💰 Цены в ⭐",
         reply_markup=main_menu_keyboard(message.from_user.id),
-        parse_mode="Markdown"
+        parse_mode="Markdown",
     )
 
 
@@ -868,7 +888,7 @@ async def menu(callback: CallbackQuery):
     await callback.message.edit_text(
         "🎁 *ГЛАВНОЕ МЕНЮ*",
         reply_markup=main_menu_keyboard(callback.from_user.id),
-        parse_mode="Markdown"
+        parse_mode="Markdown",
     )
     await callback.answer()
 
@@ -884,7 +904,7 @@ async def show_models(callback: CallbackQuery):
     await callback.message.edit_text(
         f"📦 *ВЫБЕРИ МОДЕЛЬ*\nСтраница {page+1}/{total}",
         reply_markup=models_keyboard(page),
-        parse_mode="Markdown"
+        parse_mode="Markdown",
     )
     await callback.answer()
 
@@ -902,7 +922,7 @@ async def select_gift(callback: CallbackQuery):
         f"💰 Мин.цена: {gift.resell_min_stars or 0}⭐\n"
         f"📦 Доступно: {gift.availability_resale} шт.\n\n"
         f"📝 Отправь диапазон цен: `500 800`",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
     )
     await callback.answer()
 
@@ -912,12 +932,14 @@ async def price_handler(message: Message):
     user_id = message.from_user.id
     if user_id not in USER_SELECTED_GIFT:
         return
-    
+
     parts = message.text.strip().replace("-", " ").split()
     if len(parts) != 2:
-        await message.answer("❌ Отправь два числа: мин и макс цена\nПример: `500 800`", parse_mode="Markdown")
+        await message.answer(
+            "❌ Отправь два числа: мин и макс цена\nПример: `500 800`", parse_mode="Markdown"
+        )
         return
-    
+
     try:
         min_p, max_p = int(parts[0]), int(parts[1])
         if min_p < 0 or max_p < 0 or min_p > max_p:
@@ -925,23 +947,25 @@ async def price_handler(message: Message):
     except:
         await message.answer("❌ Введи корректные числа")
         return
-    
+
     gift_id = USER_SELECTED_GIFT.pop(user_id)
     base = BASE_GIFTS_BY_ID.get(gift_id)
     if not base:
         await message.answer("❌ Модель не найдена")
         return
-    
+
     LAST_SEARCH_BY_USER[user_id] = {"gift_id": gift_id, "min_stars": min_p, "max_stars": max_p}
-    
-    status = await message.answer(f"⏳ *Ищу {base.title} от {min_p} до {max_p} ⭐...*", parse_mode="Markdown")
-    
+
+    status = await message.answer(
+        f"⏳ *Ищу {base.title} от {min_p} до {max_p} ⭐...*", parse_mode="Markdown"
+    )
+
     seen = get_seen_slugs(gift_id, min_p, max_p)
     results = await find_market_gifts(gift_id, min_p, max_p, SEARCH_RESULT_LIMIT, seen)
-    
+
     LAST_RESULTS_BY_USER[user_id] = results
     remember_seen_results(gift_id, min_p, max_p, results)
-    
+
     await status.delete()
     await send_search_results(message, base, results, min_p, max_p)
 
@@ -953,7 +977,7 @@ async def repeat_search(callback: CallbackQuery):
     if not search:
         await callback.answer("Нет прошлого поиска")
         return
-    
+
     gift_id = search["gift_id"]
     min_p = search["min_stars"]
     max_p = search["max_stars"]
@@ -961,15 +985,15 @@ async def repeat_search(callback: CallbackQuery):
     if not base:
         await callback.answer("Модель не найдена")
         return
-    
+
     await callback.message.edit_text(f"⏳ *Ищу ещё...*", parse_mode="Markdown")
-    
+
     seen = get_seen_slugs(gift_id, min_p, max_p)
     results = await find_market_gifts(gift_id, min_p, max_p, SEARCH_RESULT_LIMIT, seen)
-    
+
     LAST_RESULTS_BY_USER[user_id] = results
     remember_seen_results(gift_id, min_p, max_p, results)
-    
+
     await callback.message.delete()
     await send_search_results(callback.message, base, results, min_p, max_p)
     await callback.answer()
@@ -992,13 +1016,17 @@ async def clear_seen(callback: CallbackQuery):
 @dp.callback_query(F.data == "owners_blacklist")
 async def show_blacklist(callback: CallbackQuery):
     if not OWNERS_BLACKLIST:
-        await callback.message.edit_text("🚫 Чёрный список пуст", reply_markup=main_menu_keyboard(callback.from_user.id))
+        await callback.message.edit_text(
+            "🚫 Чёрный список пуст", reply_markup=main_menu_keyboard(callback.from_user.id)
+        )
         await callback.answer()
         return
     text = "🚫 *ЧЁРНЫЙ СПИСОК ВЛАДЕЛЬЦЕВ*\n\n"
     for i, (key, label) in enumerate(OWNERS_BLACKLIST.items(), 1):
         text += f"{i}. `{label}`\n"
-    await callback.message.edit_text(text, reply_markup=blacklist_keyboard(), parse_mode="Markdown")
+    await callback.message.edit_text(
+        text, reply_markup=blacklist_keyboard(), parse_mode="Markdown"
+    )
     await callback.answer()
 
 
@@ -1039,7 +1067,7 @@ async def clear_blacklist(callback: CallbackQuery):
 
 
 # ==========================
-# АДМИН-ПАНЕЛЬ
+# АДМИН-ПАНЕЛЬ (ДЛЯ ДОБАВЛЕНИЯ СЕССИИ)
 # ==========================
 
 @dp.callback_query(F.data == "auth_start")
@@ -1113,7 +1141,7 @@ async def monitor_panel(callback: CallbackQuery):
     await callback.message.edit_text(
         f"📡 *МОНИТОРИНГ*\n\nОтправлено: {len(SENT_MONITOR_SLUGS)}",
         reply_markup=monitor_admin_keyboard(),
-        parse_mode="Markdown"
+        parse_mode="Markdown",
     )
     await callback.answer()
 
@@ -1164,18 +1192,20 @@ async def cancel_cmd(message: Message, state: FSMContext):
 
 async def main():
     global OWNERS_BLACKLIST, SEEN_GIFTS_BY_QUERY, SENT_MONITOR_SLUGS, bot_settings, LINKS_PER_MESSAGE, DELAY_BETWEEN_BATCHES
-    
+
     OWNERS_BLACKLIST = load_owners_blacklist()
     SEEN_GIFTS_BY_QUERY = load_seen_gifts()
     SENT_MONITOR_SLUGS = load_sent_monitor_slugs()
     bot_settings = load_settings()
     LINKS_PER_MESSAGE = bot_settings.get("links_per_message", 10)
     DELAY_BETWEEN_BATCHES = bot_settings.get("delay_between_batches", 30)
-    
-    log.info(f"Loaded: blacklist={len(OWNERS_BLACKLIST)}, seen={len(SEEN_GIFTS_BY_QUERY)}, monitor={len(SENT_MONITOR_SLUGS)}")
-    
+
+    log.info(
+        f"Loaded: blacklist={len(OWNERS_BLACKLIST)}, seen={len(SEEN_GIFTS_BY_QUERY)}, monitor={len(SENT_MONITOR_SLUGS)}"
+    )
+
     await ensure_user_client_connected()
-    
+
     if await is_user_client_authorized():
         me = await user_client.get_me()
         log.info(f"Telethon signed in as {me.first_name}")
@@ -1186,7 +1216,7 @@ async def main():
             log.error(f"Models load error: {e}")
     else:
         log.info("Telethon not authorized")
-    
+
     await dp.start_polling(bot)
 
 
