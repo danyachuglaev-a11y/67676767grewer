@@ -68,7 +68,7 @@ logging.basicConfig(
 log = logging.getLogger("nft-gift-bot")
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 
 user_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
@@ -1074,7 +1074,7 @@ async def clear_blacklist(callback: CallbackQuery):
 # ==========================
 
 @dp.callback_query(F.data == "auth_start")
-async def auth_start(callback: CallbackQuery):
+async def auth_start_callback(callback: CallbackQuery):
     if not is_admin_user(callback.from_user.id):
         await callback.answer()
         return
@@ -1096,7 +1096,7 @@ async def auth_start(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data == "auth_cancel")
-async def auth_cancel(callback: CallbackQuery):
+async def auth_cancel_callback(callback: CallbackQuery):
     if not is_admin_user(callback.from_user.id):
         await callback.answer()
         return
