@@ -24,6 +24,7 @@ from telethon.errors import (
     SessionPasswordNeededError,
 )
 from telethon.tl import functions
+from telethon.tl.types import PeerUser
 
 # ==========================
 # НАСТРОЙКИ
@@ -92,6 +93,8 @@ bot_settings = {
 LINKS_PER_MESSAGE = bot_settings["links_per_message"]
 DELAY_BETWEEN_BATCHES = bot_settings["delay_between_batches"]
 last_send_time_by_model: Dict[str, float] = {}
+
+PAID_MESSAGES_CACHE: Dict[int, bool] = {}
 
 
 @dataclass
@@ -505,6 +508,42 @@ async def resolve_owner_info(raw_gift: Any) -> OwnerInfo:
     return OwnerInfo(key=owner_name, label=label, username=None, link=None)
 
 
+def extract_user_id(raw_id: Any) -> Optional[int]:
+    """Извлекает числовой ID из PeerUser или прямого числа"""
+    if raw_id is None:
+        return None
+    if isinstance(raw_id, int):
+        return raw_id
+    if isinstance(raw_id, PeerUser):
+        return raw_id.user_id
+    if hasattr(raw_id, 'user_id'):
+        return raw_id.user_id
+    try:
+        return int(raw_id)
+    except:
+        return None
+
+
+async def has_paid_messages_enabled(user_id: int) -> bool:
+    """Проверяет, включена ли у пользователя опция 'писать за звезды'"""
+    if user_id in PAID_MESSAGES_CACHE:
+        return PAID_MESSAGES_CACHE[user_id]
+    
+    try:
+        full_user = await user_client(functions.users.GetFullUserRequest(id=user_id))
+        result = False
+        if hasattr(full_user, 'user') and hasattr(full_user.user, 'require_stars_to_message'):
+            result = getattr(full_user.user, 'require_stars_to_message', False)
+        PAID_MESSAGES_CACHE[user_id] = result
+        if result:
+            log.debug(f"User {user_id} has paid messages enabled")
+        return result
+    except Exception as e:
+        log.debug(f"Check paid messages for user {user_id} failed: {e}")
+        PAID_MESSAGES_CACHE[user_id] = False
+        return False
+
+
 async def find_market_gifts(
     gift_id: int,
     min_stars: int,
@@ -554,6 +593,13 @@ async def find_market_gifts(
             owner = await resolve_owner_info(raw)
             if is_owner_blacklisted(owner.key):
                 continue
+            
+            owner_id_raw = get_field(raw, "owner_id")
+            owner_id = extract_user_id(owner_id_raw)
+            if owner_id and await has_paid_messages_enabled(owner_id):
+                log.debug(f"Skipping {slug} - owner requires stars to message")
+                continue
+            
             found.append(
                 MarketGift(
                     title=str(get_field(raw, "title") or "Gift"),
@@ -960,7 +1006,7 @@ async def repeat_search(callback: CallbackQuery):
     user_id = callback.from_user.id
     search = LAST_SEARCH_BY_USER.get(user_id)
     if not search:
-        await callback.answer("Нет прошлого поиска")
+        await callback.answer("Нет прошлого поиска", show_alert=True)
         return
 
     gift_id = search["gift_id"]
@@ -968,9 +1014,12 @@ async def repeat_search(callback: CallbackQuery):
     max_p = search["max_stars"]
     base = BASE_GIFTS_BY_ID.get(gift_id)
     if not base:
-        await callback.answer("Модель не найдена")
+        await callback.answer("Модель не найдена", show_alert=True)
         return
 
+    # Отвечаем на callback сразу, чтобы он не истёк
+    await callback.answer("🔍 Ищу...")
+    
     await callback.message.edit_text(f"⏳ *Ищу ещё...*", parse_mode="Markdown")
 
     seen = get_seen_slugs(gift_id, min_p, max_p)
@@ -981,7 +1030,6 @@ async def repeat_search(callback: CallbackQuery):
 
     await callback.message.delete()
     await send_search_results(callback.message, base, results, min_p, max_p)
-    await callback.answer()
 
 
 @dp.callback_query(F.data == "clear_seen_current")
@@ -990,7 +1038,8 @@ async def clear_seen(callback: CallbackQuery):
     search = LAST_SEARCH_BY_USER.get(user_id)
     if search:
         clear_seen_for_query(search["gift_id"], search["min_stars"], search["max_stars"])
-    await callback.answer("История сброшена")
+    
+    await callback.answer("🧹 История сброшена")
     await callback.message.edit_text("🧹 История сброшена", reply_markup=main_menu_keyboard(user_id))
 
 
