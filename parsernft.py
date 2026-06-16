@@ -5,7 +5,9 @@ import json
 import logging
 import random
 import re
+import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from aiogram import Bot, Dispatcher, F
@@ -39,9 +41,9 @@ ADMIN_ID = 8002472821
 REQUIRED_CHANNEL = "@fcklole"
 REQUIRED_CHANNEL_URL = "https://t.me/fcklole"
 
-# ID группы для мониторинга
+# ID группы для мониторинга (сюда будут лететь новые подарки)
 MONITOR_CHAT_ID = -1004223195405
-MONITOR_INTERVAL = 60
+MONITOR_INTERVAL = 60  # секунд между сканами
 
 # ==========================
 
@@ -55,6 +57,7 @@ OWNERS_BLACKLIST_FILE = "owners_blacklist.json"
 SEEN_GIFTS_FILE = "seen_gifts.json"
 SENT_MONITOR_SLUGS_FILE = "sent_monitor_slugs.json"
 SETTINGS_FILE = "bot_settings.json"
+MARKET_STATE_FILE = "market_state.json"  # НОВЫЙ файл для состояния рынка
 
 # ==========================
 
@@ -95,6 +98,9 @@ DELAY_BETWEEN_BATCHES = bot_settings["delay_between_batches"]
 last_send_time_by_model: Dict[str, float] = {}
 
 PAID_MESSAGES_CACHE: Dict[int, bool] = {}
+
+# НОВЫЙ трекер состояния рынка
+market_snapshots: Dict[int, Dict[str, Any]] = {}  # gift_id -> {"slugs": list, "num_map": dict, "timestamp": float}
 
 
 @dataclass
@@ -206,6 +212,39 @@ def save_sent_monitor_slugs(slugs: set):
         pass
 
 
+def load_market_state() -> Dict[int, Dict[str, Any]]:
+    """Загружает состояние рынка из файла"""
+    try:
+        with open(MARKET_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            result = {}
+            for key, value in data.items():
+                result[int(key)] = {
+                    "slugs": value.get("slugs", []),
+                    "num_map": value.get("num_map", {}),
+                    "timestamp": value.get("timestamp", 0)
+                }
+            return result
+    except:
+        return {}
+
+
+def save_market_state():
+    """Сохраняет состояние рынка в файл"""
+    try:
+        data = {}
+        for gift_id, snap in market_snapshots.items():
+            data[str(gift_id)] = {
+                "slugs": snap["slugs"],
+                "num_map": snap["num_map"],
+                "timestamp": snap["timestamp"]
+            }
+        with open(MARKET_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except:
+        pass
+
+
 # ==========================
 # ПРОВЕРКА ПОДПИСКИ
 # ==========================
@@ -247,7 +286,7 @@ async def check_sub(callback: CallbackQuery):
 
 
 # ==========================
-# АВТОРИЗАЦИЯ TELETHON (ТОЛЬКО ДЛЯ АДМИНА)
+# АВТОРИЗАЦИЯ TELETHON
 # ==========================
 
 class AuthState(StatesGroup):
@@ -264,6 +303,32 @@ async def ensure_user_client_connected():
 async def is_user_client_authorized() -> bool:
     await ensure_user_client_connected()
     return await user_client.is_user_authorized()
+
+
+# НОВАЯ КОМАНДА: проверка сессии
+@dp.message(Command("check_session"))
+async def check_session_command(message: Message):
+    """Проверка статуса сессии (только для админа)"""
+    if not is_admin_user(message.from_user.id):
+        await message.answer("⛔ Только для администратора")
+        return
+    
+    if await is_user_client_authorized():
+        me = await user_client.get_me()
+        name = me.first_name or me.username or str(me.id)
+        await message.answer(
+            f"✅ *Сессия активна*\n\n"
+            f"👤 Аккаунт: `{name}`\n"
+            f"📦 Моделей загружено: {len(BASE_GIFTS)}\n\n"
+            f"Если сессия слетела — используй /add_session",
+            parse_mode="Markdown"
+        )
+    else:
+        await message.answer(
+            "❌ *Сессия не активна*\n\n"
+            "Используй /add_session чтобы добавить сессию заново.",
+            parse_mode="Markdown"
+        )
 
 
 @dp.message(Command("add_session"))
@@ -312,7 +377,6 @@ async def auth_phone(message: Message, state: FSMContext):
 @dp.message(AuthState.waiting_code)
 async def auth_code(message: Message, state: FSMContext):
     code = message.text.strip()
-    # Убираем всё кроме цифр
     code = "".join(ch for ch in code if ch.isdigit())
     
     if len(code) < 4:
@@ -509,7 +573,6 @@ async def resolve_owner_info(raw_gift: Any) -> OwnerInfo:
 
 
 def extract_user_id(raw_id: Any) -> Optional[int]:
-    """Извлекает числовой ID из PeerUser или прямого числа"""
     if raw_id is None:
         return None
     if isinstance(raw_id, int):
@@ -525,7 +588,6 @@ def extract_user_id(raw_id: Any) -> Optional[int]:
 
 
 async def has_paid_messages_enabled(user_id: int) -> bool:
-    """Проверяет, включена ли у пользователя опция 'писать за звезды'"""
     if user_id in PAID_MESSAGES_CACHE:
         return PAID_MESSAGES_CACHE[user_id]
     
@@ -615,6 +677,82 @@ async def find_market_gifts(
         if not offset:
             break
     return found
+
+
+# ==========================
+# НОВАЯ ФУНКЦИЯ: ПОЛНЫЙ СКАН РЫНКА ДЛЯ МОНИТОРИНГА
+# ==========================
+
+async def get_full_market_state(
+    gift_id: int,
+    min_stars: int,
+    max_stars: int,
+    max_pages: int = 10
+) -> Tuple[List[MarketGift], Dict[str, int]]:
+    """Получает полное состояние рынка для модели (все доступные подарки)"""
+    results = []
+    num_map = {}
+    offset = ""
+    pages = 0
+    
+    while pages < max_pages:
+        pages += 1
+        try:
+            result = await user_client(
+                functions.payments.GetResaleStarGiftsRequest(
+                    gift_id=gift_id,
+                    offset=offset,
+                    limit=REQUEST_PAGE_LIMIT,
+                    sort_by_price=True,
+                    sort_by_num=False,
+                    stars_only=True,
+                    for_craft=False,
+                )
+            )
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds + 1)
+            continue
+        except Exception as e:
+            log.error(f"Full scan error for gift {gift_id}: {e}")
+            break
+        
+        gifts = getattr(result, "gifts", [])
+        if not gifts:
+            break
+        
+        for raw in gifts:
+            slug = get_field(raw, "slug")
+            if not slug:
+                continue
+            price = extract_stars_amount(get_field(raw, "resell_amount"))
+            if price < min_stars or price > max_stars:
+                continue
+            owner = await resolve_owner_info(raw)
+            if is_owner_blacklisted(owner.key):
+                continue
+            
+            owner_id_raw = get_field(raw, "owner_id")
+            owner_id = extract_user_id(owner_id_raw)
+            if owner_id and await has_paid_messages_enabled(owner_id):
+                continue
+            
+            num = safe_int(get_field(raw, "num"))
+            num_map[slug] = num
+            results.append(
+                MarketGift(
+                    title=str(get_field(raw, "title") or "Gift"),
+                    num=num,
+                    slug=slug,
+                    price=price,
+                    owner=owner,
+                )
+            )
+        
+        offset = getattr(result, "next_offset", "")
+        if not offset:
+            break
+    
+    return results, num_map
 
 
 # ==========================
@@ -787,46 +925,159 @@ async def clear_blacklist(callback: CallbackQuery):
 
 
 # ==========================
-# МОНИТОРИНГ
+# НОВАЯ ВЕРСИЯ МОНИТОРИНГА - ДЕТЕКТИТ ТОЛЬКО НОВЫЕ ВЫСТАВЛЕНИЯ
 # ==========================
 
-async def monitor_worker():
-    global monitor_running, SENT_MONITOR_SLUGS
+MONITOR_SCAN_PAGES = 8  # сколько страниц сканировать
+MONITOR_SEND_DELAY = 3   # задержка между отправками в секундах
+
+
+async def monitor_worker_v2():
+    """Мониторинг новых выставлений — отправляет каждую ссылку отдельно"""
+    global monitor_running, SENT_MONITOR_SLUGS, market_snapshots
+    
+    # Загружаем уже отправленные слаги
+    SENT_MONITOR_SLUGS = load_sent_monitor_slugs()
+    # Загружаем состояние рынка
+    market_snapshots = load_market_state()
+    
+    log.info(f"🔄 Monitor started. Sent slugs: {len(SENT_MONITOR_SLUGS)}, Market snapshots: {len(market_snapshots)}")
+    
     while monitor_running:
         try:
-            if not await is_user_client_authorized() or not BASE_GIFTS:
+            # Проверяем авторизацию
+            if not await is_user_client_authorized():
+                log.warning("⚠️ Telethon not authorized. Monitor paused.")
+                await asyncio.sleep(30)
+                continue
+            
+            if not BASE_GIFTS:
+                log.warning("⚠️ No base gifts loaded. Monitor paused.")
+                await asyncio.sleep(30)
+                continue
+            
+            log.info("🔍 Starting market scan for new listings...")
+            
+            # Сканируем только модели с доступными реселлами
+            models_to_scan = [g for g in BASE_GIFTS if g.availability_resale and g.availability_resale > 0]
+            
+            if not models_to_scan:
+                log.warning("⚠️ No models with resale available.")
                 await asyncio.sleep(MONITOR_INTERVAL)
                 continue
-
-            new_gifts = []
-            for base in BASE_GIFTS[:15]:
-                results = await find_market_gifts(
-                    base.gift_id,
-                    base.resell_min_stars or 0,
-                    base.resell_min_stars + 5000 if base.resell_min_stars else 10000,
-                    need=5,
-                    skip_slugs=SENT_MONITOR_SLUGS,
-                )
-                for g in results:
-                    if g.slug not in SENT_MONITOR_SLUGS:
-                        new_gifts.append(g)
-                        SENT_MONITOR_SLUGS.add(g.slug)
-
-            if new_gifts and MONITOR_CHAT_ID:
-                for base in BASE_GIFTS:
-                    bgifts = [g for g in new_gifts if g.title == base.title]
-                    if bgifts:
-                        text = f"🆕 *НОВЫЕ ПОДАРКИ* | {base.title}\n\n{format_gift_list(bgifts[:LINKS_PER_MESSAGE])}"
+            
+            for base in models_to_scan:
+                if not monitor_running:
+                    break
+                
+                # Определяем диапазон цен для скана
+                min_price = base.resell_min_stars or 0
+                max_price = min_price + 10000  # широкий диапазон
+                
+                # Получаем текущее состояние рынка
+                try:
+                    current_gifts, current_num_map = await get_full_market_state(
+                        base.gift_id,
+                        min_price,
+                        max_price,
+                        max_pages=MONITOR_SCAN_PAGES
+                    )
+                except Exception as e:
+                    log.error(f"Error scanning {base.title}: {e}")
+                    continue
+                
+                if not current_gifts:
+                    continue
+                
+                current_slugs = [g.slug for g in current_gifts]
+                
+                # Проверяем, есть ли предыдущий снимок для этой модели
+                old_snapshot = market_snapshots.get(base.gift_id)
+                new_listings = []
+                
+                if old_snapshot:
+                    old_slugs = set(old_snapshot.get("slugs", []))
+                    # Находим новые слаги
+                    for slug in current_slugs:
+                        if slug not in old_slugs and slug not in SENT_MONITOR_SLUGS:
+                            # Находим объект подарка
+                            gift_obj = next((g for g in current_gifts if g.slug == slug), None)
+                            if gift_obj:
+                                new_listings.append(gift_obj)
+                else:
+                    # Первый запуск - все текущие подарки считаем уже известными
+                    # Чтобы не спамить, просто сохраняем состояние
+                    log.info(f"📸 First snapshot for {base.title}: {len(current_slugs)} items")
+                
+                # Отправляем новые подарки
+                if new_listings:
+                    log.info(f"🆕 Found {len(new_listings)} new listings for {base.title}")
+                    
+                    for gift in new_listings:
+                        # Проверяем ещё раз, не отправили ли уже
+                        if gift.slug in SENT_MONITOR_SLUGS:
+                            continue
+                        
+                        # Формируем сообщение для ОДНОГО подарка
+                        owner = f"@{gift.owner.username}" if gift.owner.username else gift.owner.label
+                        num_text = f" #{gift.num}" if gift.num else ""
+                        
+                        message_text = (
+                            f"🆕 *НОВЫЙ ПОДАРОК НА ПРОДАЖЕ*\n"
+                            f"━━━━━━━━━━━━━━━━━\n"
+                            f"🎁 *{gift.title}{num_text}*\n"
+                            f"💰 Цена: {gift.price} ⭐\n"
+                            f"👤 Владелец: {owner}\n"
+                            f"🔗 [Купить]({gift.link})\n"
+                            f"━━━━━━━━━━━━━━━━━\n"
+                            f"⏱ Обнаружен: {datetime.now().strftime('%H:%M:%S')}"
+                        )
+                        
+                        # Отправляем в группу
                         try:
-                            await bot.send_message(MONITOR_CHAT_ID, text, disable_web_page_preview=True)
+                            await bot.send_message(
+                                MONITOR_CHAT_ID,
+                                message_text,
+                                disable_web_page_preview=True,
+                                parse_mode="Markdown"
+                            )
+                            # Запоминаем отправленный слаг
+                            SENT_MONITOR_SLUGS.add(gift.slug)
+                            save_sent_monitor_slugs(SENT_MONITOR_SLUGS)
+                            
+                            log.info(f"📤 Sent new listing: {gift.slug}")
+                            
+                            # Задержка между отправками
+                            await asyncio.sleep(MONITOR_SEND_DELAY)
+                            
                         except Exception as e:
-                            log.error(f"Monitor send error: {e}")
-                        await asyncio.sleep(random.uniform(2, 5))
-                        save_sent_monitor_slugs(SENT_MONITOR_SLUGS)
+                            log.error(f"Send error for {gift.slug}: {e}")
+                
+                # Обновляем снимок состояния
+                market_snapshots[base.gift_id] = {
+                    "slugs": current_slugs,
+                    "num_map": current_num_map,
+                    "timestamp": time.time()
+                }
+                save_market_state()
+                
+                # Задержка между моделями
+                await asyncio.sleep(1)
+            
+            log.info(f"✅ Scan complete. Next scan in {MONITOR_INTERVAL}s")
+            
         except Exception as e:
             log.error(f"Monitor error: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # Ждём до следующего скана
         await asyncio.sleep(MONITOR_INTERVAL)
 
+
+# ==========================
+# УПРАВЛЕНИЕ МОНИТОРИНГОМ
+# ==========================
 
 @dp.callback_query(F.data == "monitor_admin_panel")
 async def monitor_panel(callback: CallbackQuery):
@@ -834,7 +1085,12 @@ async def monitor_panel(callback: CallbackQuery):
         await callback.answer("Только для админа")
         return
     await callback.message.edit_text(
-        f"📡 *МОНИТОРИНГ*\n\nОтправлено: {len(SENT_MONITOR_SLUGS)}",
+        f"📡 *МОНИТОРИНГ НОВЫХ ВЫСТАВЛЕНИЙ*\n\n"
+        f"📊 Статус: {'🟢 РАБОТАЕТ' if monitor_running else '🔴 ОСТАНОВЛЕН'}\n"
+        f"📤 Отправлено: {len(SENT_MONITOR_SLUGS)} подарков\n"
+        f"📸 Сохранено снимков: {len(market_snapshots)}\n"
+        f"⏱ Интервал: {MONITOR_INTERVAL} сек.\n\n"
+        f"Каждая новая позиция отправляется отдельным сообщением.",
         reply_markup=monitor_admin_keyboard(),
         parse_mode="Markdown",
     )
@@ -844,11 +1100,14 @@ async def monitor_panel(callback: CallbackQuery):
 @dp.callback_query(F.data == "monitor_start")
 async def monitor_start(callback: CallbackQuery):
     global monitor_running, monitor_task
+    if not is_admin_user(callback.from_user.id):
+        await callback.answer("Только для админа")
+        return
     if monitor_running:
         await callback.answer("Уже работает")
         return
     monitor_running = True
-    monitor_task = asyncio.create_task(monitor_worker())
+    monitor_task = asyncio.create_task(monitor_worker_v2())
     await callback.answer("✅ Мониторинг запущен")
     await monitor_panel(callback)
 
@@ -856,6 +1115,9 @@ async def monitor_start(callback: CallbackQuery):
 @dp.callback_query(F.data == "monitor_stop")
 async def monitor_stop(callback: CallbackQuery):
     global monitor_running
+    if not is_admin_user(callback.from_user.id):
+        await callback.answer("Только для админа")
+        return
     monitor_running = False
     await callback.answer("⏹️ Мониторинг остановлен")
     await monitor_panel(callback)
@@ -863,10 +1125,15 @@ async def monitor_stop(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "monitor_reset")
 async def monitor_reset(callback: CallbackQuery):
-    global SENT_MONITOR_SLUGS
+    global SENT_MONITOR_SLUGS, market_snapshots
+    if not is_admin_user(callback.from_user.id):
+        await callback.answer("Только для админа")
+        return
     SENT_MONITOR_SLUGS = set()
+    market_snapshots = {}
     save_sent_monitor_slugs(SENT_MONITOR_SLUGS)
-    await callback.answer("История сброшена")
+    save_market_state()
+    await callback.answer("🧹 История и состояние сброшены")
     await monitor_panel(callback)
 
 
@@ -889,7 +1156,8 @@ async def cmd_start(message: Message):
         if is_admin_user(message.from_user.id):
             await message.answer(
                 "⚠️ *Сессия не добавлена!*\n\n"
-                "Используй команду `/add_session` чтобы добавить сессию Telegram.\n\n"
+                "Используй команду `/add_session` чтобы добавить сессию Telegram.\n"
+                "Или `/check_session` для проверки статуса.\n\n"
                 "После добавления сессии бот начнёт работать.",
                 parse_mode="Markdown"
             )
@@ -906,7 +1174,8 @@ async def cmd_start(message: Message):
     await message.answer(
         "🎁 *ПАРСЕР ПОДАРКОВ*\n\n"
         "📦 ВЫБРАТЬ МОДЕЛЬ — выбери подарок и укажи цену\n"
-        "🚫 ЧЁРНЫЙ СПИСОК — управление забаненными владельцами\n\n"
+        "🚫 ЧЁРНЫЙ СПИСОК — управление забаненными владельцами\n"
+        "📡 МОНИТОРИНГ — автоматическое отслеживание новых выставлений\n\n"
         "📌 Пример цены: `500 800`\n"
         "💰 Цены в ⭐",
         reply_markup=main_menu_keyboard(message.from_user.id),
@@ -1017,7 +1286,6 @@ async def repeat_search(callback: CallbackQuery):
         await callback.answer("Модель не найдена", show_alert=True)
         return
 
-    # Отвечаем на callback сразу, чтобы он не истёк
     await callback.answer("🔍 Ищу...")
     
     await callback.message.edit_text(f"⏳ *Ищу ещё...*", parse_mode="Markdown")
@@ -1063,16 +1331,17 @@ async def cancel_cmd(message: Message, state: FSMContext):
 # ==========================
 
 async def main():
-    global OWNERS_BLACKLIST, SEEN_GIFTS_BY_QUERY, SENT_MONITOR_SLUGS, bot_settings, LINKS_PER_MESSAGE, DELAY_BETWEEN_BATCHES
+    global OWNERS_BLACKLIST, SEEN_GIFTS_BY_QUERY, SENT_MONITOR_SLUGS, bot_settings, LINKS_PER_MESSAGE, DELAY_BETWEEN_BATCHES, market_snapshots
 
     OWNERS_BLACKLIST = load_owners_blacklist()
     SEEN_GIFTS_BY_QUERY = load_seen_gifts()
     SENT_MONITOR_SLUGS = load_sent_monitor_slugs()
+    market_snapshots = load_market_state()
     bot_settings = load_settings()
     LINKS_PER_MESSAGE = bot_settings.get("links_per_message", 10)
     DELAY_BETWEEN_BATCHES = bot_settings.get("delay_between_batches", 30)
 
-    log.info(f"Loaded: blacklist={len(OWNERS_BLACKLIST)}, seen={len(SEEN_GIFTS_BY_QUERY)}, monitor={len(SENT_MONITOR_SLUGS)}")
+    log.info(f"Loaded: blacklist={len(OWNERS_BLACKLIST)}, seen={len(SEEN_GIFTS_BY_QUERY)}, monitor={len(SENT_MONITOR_SLUGS)}, snapshots={len(market_snapshots)}")
 
     await ensure_user_client_connected()
 
@@ -1085,8 +1354,10 @@ async def main():
         except Exception as e:
             log.error(f"Models load error: {e}")
         if MONITOR_CHAT_ID:
+            global monitor_running, monitor_task
             monitor_running = True
-            monitor_task = asyncio.create_task(monitor_worker())
+            monitor_task = asyncio.create_task(monitor_worker_v2())
+            log.info("📡 Monitor task started")
     else:
         log.info("Telethon not authorized. Admin must run /add_session")
 
