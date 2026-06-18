@@ -32,7 +32,7 @@ from telethon.tl.types import PeerUser
 
 API_ID = 26259835
 API_HASH = "3fa32264398920f001dd2428b42060f6"
-BOT_TOKEN = "8834103135:AAFuNDHfqpAHV3LM3Ardg-5HAb9aMu0xCT8"
+BOT_TOKEN = "8850316327:AAG-kT-pJL7w08ZjrRcx6rcvWi0dml1i_xw"
 ADMIN_ID = 8002472821
 
 # Канал для подписки (если нужен)
