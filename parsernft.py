@@ -32,15 +32,15 @@ from telethon.tl.types import PeerUser
 
 API_ID = 26259835
 API_HASH = "3fa32264398920f001dd2428b42060f6"
-BOT_TOKEN = "8850316327:AAG-kT-pJL7w08ZjrRcx6rcvWi0dml1i_xw"
-ADMIN_ID = 8002472821
+BOT_TOKEN = "8206373294:AAFEHHDDZOdX9i00voiMI55g68gjKjXFZeE"
+ADMIN_ID = 8855434638
 
 # Канал для подписки (если нужен)
-REQUIRED_CHANNEL = "@fcklole"
-REQUIRED_CHANNEL_URL = "https://t.me/fcklole"
+REQUIRED_CHANNEL = "@pupuhop"
+REQUIRED_CHANNEL_URL = "https://t.me/pupuhop"
 
 # ID группы для мониторинга
-MONITOR_CHAT_ID = -1004223195405
+MONITOR_CHAT_ID = -1005340426610
 MONITOR_INTERVAL = 60
 
 # ==========================
