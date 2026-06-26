@@ -586,9 +586,8 @@ def main_menu_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def admin_panel_keyboard() -> InlineKeyboardMarkup:
-    status = "✅ АКТИВНА" if user_client.is_connected() and user_client.is_authorized() else "❌ НЕ АКТИВНА"
     buttons = [
-        [InlineKeyboardButton(text=f"🔐 СЕССИЯ: {status}", callback_data="check_session")],
+        [InlineKeyboardButton(text="🔐 ПРОВЕРИТЬ СЕССИЮ", callback_data="check_session")],
         [InlineKeyboardButton(text="➕ ДОБАВИТЬ СЕССИЮ", callback_data="add_session_btn")],
         [InlineKeyboardButton(text="🔄 ОБНОВИТЬ МОДЕЛИ", callback_data="reload_models")],
         [InlineKeyboardButton(text="📊 СТАТУС БОТА", callback_data="bot_status")],
@@ -662,13 +661,12 @@ async def admin_panel(callback: CallbackQuery):
         return
     status = "✅ АКТИВНА" if await is_user_client_authorized() else "❌ НЕ АКТИВНА"
     await callback.message.edit_text(
-        f"⚙️ *АДМИН-ПАНЕЛЬ*\n\n"
+        f"⚙️ АДМИН-ПАНЕЛЬ\n\n"
         f"🔐 Сессия: {status}\n"
         f"📦 Моделей: {len(BASE_GIFTS)}\n"
         f"📡 Мониторинг: {'🟢 ВКЛ' if monitor_running else '🔴 ВЫКЛ'}\n"
         f"🚫 В черном списке: {len(OWNERS_BLACKLIST)}",
-        reply_markup=admin_panel_keyboard(),
-        parse_mode="Markdown"
+        reply_markup=admin_panel_keyboard()
     )
     await callback.answer()
 
@@ -715,7 +713,7 @@ async def bot_status_callback(callback: CallbackQuery):
         await callback.answer("⛔ Только для админа")
         return
     status_text = (
-        f"📊 *СТАТУС БОТА*\n\n"
+        f"📊 СТАТУС БОТА\n\n"
         f"🤖 Бот: @{bot.username}\n"
         f"🔐 Сессия: {'✅ АКТИВНА' if await is_user_client_authorized() else '❌ НЕ АКТИВНА'}\n"
         f"📦 Моделей: {len(BASE_GIFTS)}\n"
@@ -724,7 +722,7 @@ async def bot_status_callback(callback: CallbackQuery):
         f"📤 Отправлено монитором: {len(SENT_MONITOR_SLUGS)}\n"
         f"📸 Снимков рынка: {len(market_snapshots)}"
     )
-    await callback.message.edit_text(status_text, parse_mode="Markdown")
+    await callback.message.edit_text(status_text)
     await callback.answer()
 
 # ==========================
@@ -794,10 +792,8 @@ async def monitor_worker():
                         if gift.slug in SENT_MONITOR_SLUGS:
                             continue
                         
-                        # Ссылка на профиль владельца
                         owner_link = gift.owner.link or gift.owner.label
                         owner_display = f"[{gift.owner.label}]({owner_link})" if gift.owner.link else gift.owner.label
-                        
                         num_text = f" #{gift.num}" if gift.num else ""
                         
                         msg = (
@@ -844,13 +840,12 @@ async def monitor_panel(callback: CallbackQuery):
         await callback.answer("Только для админа")
         return
     await callback.message.edit_text(
-        f"📡 *МОНИТОРИНГ*\n\n"
+        f"📡 МОНИТОРИНГ\n\n"
         f"📊 Статус: {'🟢 РАБОТАЕТ' if monitor_running else '🔴 ОСТАНОВЛЕН'}\n"
         f"📤 Отправлено: {len(SENT_MONITOR_SLUGS)}\n"
         f"📸 Снимков: {len(market_snapshots)}\n"
         f"⏱ Интервал: {MONITOR_INTERVAL} сек.",
-        reply_markup=monitor_admin_keyboard(),
-        parse_mode="Markdown"
+        reply_markup=monitor_admin_keyboard()
     )
     await callback.answer()
 
@@ -905,10 +900,10 @@ async def show_blacklist(callback: CallbackQuery):
         await callback.message.edit_text("🚫 Чёрный список пуст", reply_markup=main_menu_keyboard(callback.from_user.id))
         await callback.answer()
         return
-    text = "🚫 *ЧЁРНЫЙ СПИСОК*\n\n"
+    text = "🚫 ЧЁРНЫЙ СПИСОК\n\n"
     for i, (key, label) in enumerate(OWNERS_BLACKLIST.items(), 1):
         text += f"{i}. {label}\n"
-    await callback.message.edit_text(text, reply_markup=blacklist_keyboard(), parse_mode="Markdown")
+    await callback.message.edit_text(text, reply_markup=blacklist_keyboard())
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("ban_owner:"))
@@ -955,35 +950,31 @@ async def cmd_start(message: Message):
     if not await is_user_client_authorized():
         if is_admin_user(message.from_user.id):
             await message.answer(
-                "⚠️ *Сессия не добавлена!*\n\n"
-                "Нажми кнопку ниже или используй /add_session",
+                "⚠️ Сессия не добавлена!\n\nНажми кнопку ниже или используй /add_session",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="➕ ДОБАВИТЬ СЕССИЮ", callback_data="add_session_btn")]
-                ]),
-                parse_mode="Markdown"
+                ])
             )
         else:
             await message.answer("⚠️ Бот настраивается. Подождите.")
         return
     await ensure_models_loaded()
     await message.answer(
-        "🎁 *ПАРСЕР ПОДАРКОВ*\n\n"
+        "🎁 ПАРСЕР ПОДАРКОВ\n\n"
         "📦 ВЫБРАТЬ МОДЕЛЬ — выбери подарок и укажи цену\n"
         "🚫 ЧЁРНЫЙ СПИСОК — управление забаненными\n"
         "⚙️ АДМИН-ПАНЕЛЬ — управление ботом\n"
         "📡 МОНИТОРИНГ — автоотслеживание новых подарков\n\n"
-        "📌 Пример цены: `500 800`\n"
-        "💰 Цены в ⭐",
-        reply_markup=main_menu_keyboard(message.from_user.id),
-        parse_mode="Markdown"
+        "📌 Пример цены: 500 800\n"
+        "💰 Цены в звездах",
+        reply_markup=main_menu_keyboard(message.from_user.id)
     )
 
 @dp.callback_query(F.data == "menu")
 async def menu(callback: CallbackQuery):
     await callback.message.edit_text(
-        "🎁 *ГЛАВНОЕ МЕНЮ*",
-        reply_markup=main_menu_keyboard(callback.from_user.id),
-        parse_mode="Markdown"
+        "🎁 ГЛАВНОЕ МЕНЮ",
+        reply_markup=main_menu_keyboard(callback.from_user.id)
     )
     await callback.answer()
 
@@ -996,9 +987,8 @@ async def show_models(callback: CallbackQuery):
         page = 0
     total = max(1, (len(BASE_GIFTS) + GIFTS_PER_PAGE - 1) // GIFTS_PER_PAGE)
     await callback.message.edit_text(
-        f"📦 *ВЫБЕРИ МОДЕЛЬ*\nСтраница {page+1}/{total}",
-        reply_markup=models_keyboard(page),
-        parse_mode="Markdown"
+        f"📦 ВЫБЕРИ МОДЕЛЬ\nСтраница {page+1}/{total}",
+        reply_markup=models_keyboard(page)
     )
     await callback.answer()
 
@@ -1011,11 +1001,10 @@ async def select_gift(callback: CallbackQuery):
         return
     USER_SELECTED_GIFT[callback.from_user.id] = gift_id
     await callback.message.edit_text(
-        f"✅ *{gift.title}*\n"
+        f"✅ {gift.title}\n"
         f"💰 Мин.цена: {gift.resell_min_stars or 0}⭐\n"
         f"📦 Доступно: {gift.availability_resale} шт.\n\n"
-        f"📝 Отправь диапазон цен: `500 800`",
-        parse_mode="Markdown"
+        f"📝 Отправь диапазон цен: 500 800"
     )
     await callback.answer()
 
@@ -1046,7 +1035,7 @@ async def price_handler(message: Message):
 
     LAST_SEARCH_BY_USER[user_id] = {"gift_id": gift_id, "min_stars": min_p, "max_stars": max_p}
 
-    status = await message.answer(f"⏳ *Ищу {base.title} от {min_p} до {max_p} ⭐...*", parse_mode="Markdown")
+    status = await message.answer(f"⏳ Ищу {base.title} от {min_p} до {max_p} ⭐...")
 
     seen = set()
     key = f"{gift_id}:{min_p}:{max_p}"
@@ -1068,14 +1057,13 @@ async def price_handler(message: Message):
         await message.answer(f"❌ По модели {base.title} ничего не найдено в диапазоне {min_p}-{max_p} ⭐")
         return
 
-    text = f"🎁 *{base.title}* | {min_p}—{max_p} ⭐\n└ Найдено: {len(results)}\n\n"
+    text = f"🎁 {base.title} | {min_p}-{max_p} ⭐\n└ Найдено: {len(results)}\n\n"
     for i, g in enumerate(results[:10], 1):
         num = f" #{g.num}" if g.num else ""
-        owner_link = g.owner.link or g.owner.label
-        owner_display = f"[{g.owner.label}]({owner_link})" if g.owner.link else g.owner.label
-        text += f"{i}. *{g.title}{num}*\n💰 {g.price} ⭐ | 👤 {owner_display}\n🔗 [Ссылка]({g.link})\n\n"
+        owner = f"@{g.owner.username}" if g.owner.username else g.owner.label
+        text += f"{i}. {g.title}{num}\n💰 {g.price} ⭐ | 👤 {owner}\n🔗 {g.link}\n\n"
 
-    await message.answer(text, disable_web_page_preview=True, parse_mode="Markdown", reply_markup=search_results_keyboard(results))
+    await message.answer(text, disable_web_page_preview=True, reply_markup=search_results_keyboard(results))
 
 @dp.callback_query(F.data == "repeat_search")
 async def repeat_search(callback: CallbackQuery):
@@ -1094,7 +1082,7 @@ async def repeat_search(callback: CallbackQuery):
         return
 
     await callback.answer("🔍 Ищу...")
-    await callback.message.edit_text("⏳ *Ищу ещё...*", parse_mode="Markdown")
+    await callback.message.edit_text("⏳ Ищу ещё...")
 
     seen = set()
     key = f"{gift_id}:{min_p}:{max_p}"
@@ -1116,14 +1104,13 @@ async def repeat_search(callback: CallbackQuery):
         await callback.message.answer(f"❌ По модели {base.title} ничего не найдено в диапазоне {min_p}-{max_p} ⭐")
         return
 
-    text = f"🎁 *{base.title}* | {min_p}—{max_p} ⭐\n└ Найдено: {len(results)}\n\n"
+    text = f"🎁 {base.title} | {min_p}-{max_p} ⭐\n└ Найдено: {len(results)}\n\n"
     for i, g in enumerate(results[:10], 1):
         num = f" #{g.num}" if g.num else ""
-        owner_link = g.owner.link or g.owner.label
-        owner_display = f"[{g.owner.label}]({owner_link})" if g.owner.link else g.owner.label
-        text += f"{i}. *{g.title}{num}*\n💰 {g.price} ⭐ | 👤 {owner_display}\n🔗 [Ссылка]({g.link})\n\n"
+        owner = f"@{g.owner.username}" if g.owner.username else g.owner.label
+        text += f"{i}. {g.title}{num}\n💰 {g.price} ⭐ | 👤 {owner}\n🔗 {g.link}\n\n"
 
-    await callback.message.answer(text, disable_web_page_preview=True, parse_mode="Markdown", reply_markup=search_results_keyboard(results))
+    await callback.message.answer(text, disable_web_page_preview=True, reply_markup=search_results_keyboard(results))
 
 @dp.callback_query(F.data == "clear_seen_current")
 async def clear_seen(callback: CallbackQuery):
