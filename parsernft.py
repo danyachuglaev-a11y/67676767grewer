@@ -71,6 +71,7 @@ SEEN_GIFTS_BY_QUERY: Dict[str, List[str]] = {}
 SENT_MONITOR_SLUGS: set = set()
 market_snapshots: Dict[int, Dict[str, Any]] = {}
 PAID_MESSAGES_CACHE: Dict[int, bool] = {}
+OWNER_CACHE: Dict[int, "OwnerInfo"] = {}
 
 monitor_running = False
 monitor_task = None
@@ -404,28 +405,78 @@ async def ensure_models_loaded():
         await load_base_gifts()
 
 # ==========================
-# РАБОТА С ВЛАДЕЛЬЦАМИ
+# РАБОТА С ВЛАДЕЛЬЦАМИ (С ЮЗЕРНЕЙМАМИ)
 # ==========================
 
 async def resolve_owner_info(raw_gift: Any) -> OwnerInfo:
+    # Проверяем кеш
+    owner_id = get_field(raw_gift, "owner_id")
+    user_id = extract_user_id(owner_id) if owner_id else None
+    
+    if user_id and user_id in OWNER_CACHE:
+        return OWNER_CACHE[user_id]
+    
+    # Сначала проверяем, есть ли username напрямую в ответе
     direct_username = get_field(raw_gift, "owner_username") or get_field(raw_gift, "username")
     if direct_username:
         username = str(direct_username).lstrip("@")
-        return OwnerInfo(
-            key=f"username:{username.lower()}",
-            label=f"@{username}",
-            username=username,
-            link=f"https://t.me/{username}"
-        )
+        if username:
+            info = OwnerInfo(
+                key=f"username:{username.lower()}",
+                label=f"@{username}",
+                username=username,
+                link=f"https://t.me/{username}"
+            )
+            if user_id:
+                OWNER_CACHE[user_id] = info
+            return info
+    
+    # Если нет - пытаемся получить через owner_id
+    if user_id:
+        try:
+            entity = await user_client.get_entity(user_id)
+            username = getattr(entity, "username", None)
+            if username:
+                username = str(username).lstrip("@")
+                info = OwnerInfo(
+                    key=f"username:{username.lower()}",
+                    label=f"@{username}",
+                    username=username,
+                    link=f"https://t.me/{username}"
+                )
+                OWNER_CACHE[user_id] = info
+                return info
+            name = getattr(entity, "first_name", "") or getattr(entity, "title", "") or str(user_id)
+            info = OwnerInfo(
+                key=f"id:{user_id}",
+                label=name[:30],
+                username=None,
+                link=None
+            )
+            OWNER_CACHE[user_id] = info
+            return info
+        except FloodWaitError as e:
+            log.warning(f"FloodWait {e.seconds}s for user {user_id}, waiting...")
+            await asyncio.sleep(e.seconds + 1)
+        except Exception as e:
+            log.debug(f"Could not get entity for {user_id}: {e}")
+    
     owner_name = get_field(raw_gift, "owner_name")
     if owner_name:
-        return OwnerInfo(
+        info = OwnerInfo(
             key=f"name:{owner_name}",
             label=str(owner_name)[:30],
             username=None,
             link=None
         )
-    return OwnerInfo(key=None, label="не указан", username=None, link=None)
+        if user_id:
+            OWNER_CACHE[user_id] = info
+        return info
+    
+    info = OwnerInfo(key=None, label="не указан", username=None, link=None)
+    if user_id:
+        OWNER_CACHE[user_id] = info
+    return info
 
 async def has_paid_messages_enabled(user_id: int) -> bool:
     if user_id in PAID_MESSAGES_CACHE:
@@ -792,8 +843,15 @@ async def monitor_worker():
                         if gift.slug in SENT_MONITOR_SLUGS:
                             continue
                         
-                        owner_link = gift.owner.link or gift.owner.label
-                        owner_display = f"[{gift.owner.label}]({owner_link})" if gift.owner.link else gift.owner.label
+                        # ЮЗЕРНЕЙМ ВЛАДЕЛЬЦА (теперь всегда есть)
+                        owner_display = f"@{gift.owner.username}" if gift.owner.username else gift.owner.label
+                        owner_link = gift.owner.link or f"https://t.me/{gift.owner.username}" if gift.owner.username else None
+                        
+                        if owner_link:
+                            owner_text = f"[{owner_display}]({owner_link})"
+                        else:
+                            owner_text = owner_display
+                        
                         num_text = f" #{gift.num}" if gift.num else ""
                         
                         msg = (
@@ -801,7 +859,7 @@ async def monitor_worker():
                             f"━━━━━━━━━━━━━━━━━\n"
                             f"🎁 *{gift.title}{num_text}*\n"
                             f"💰 Цена: *{gift.price}* ⭐\n"
-                            f"👤 Владелец: {owner_display}\n"
+                            f"👤 Владелец: {owner_text}\n"
                             f"🔗 [Купить]({gift.link})\n"
                             f"━━━━━━━━━━━━━━━━━\n"
                             f"⏱ {datetime.now().strftime('%H:%M:%S')}"
@@ -1060,8 +1118,8 @@ async def price_handler(message: Message):
     text = f"🎁 {base.title} | {min_p}-{max_p} ⭐\n└ Найдено: {len(results)}\n\n"
     for i, g in enumerate(results[:10], 1):
         num = f" #{g.num}" if g.num else ""
-        owner = f"@{g.owner.username}" if g.owner.username else g.owner.label
-        text += f"{i}. {g.title}{num}\n💰 {g.price} ⭐ | 👤 {owner}\n🔗 {g.link}\n\n"
+        owner_display = f"@{g.owner.username}" if g.owner.username else g.owner.label
+        text += f"{i}. {g.title}{num}\n💰 {g.price} ⭐ | 👤 {owner_display}\n🔗 {g.link}\n\n"
 
     await message.answer(text, disable_web_page_preview=True, reply_markup=search_results_keyboard(results))
 
@@ -1107,8 +1165,8 @@ async def repeat_search(callback: CallbackQuery):
     text = f"🎁 {base.title} | {min_p}-{max_p} ⭐\n└ Найдено: {len(results)}\n\n"
     for i, g in enumerate(results[:10], 1):
         num = f" #{g.num}" if g.num else ""
-        owner = f"@{g.owner.username}" if g.owner.username else g.owner.label
-        text += f"{i}. {g.title}{num}\n💰 {g.price} ⭐ | 👤 {owner}\n🔗 {g.link}\n\n"
+        owner_display = f"@{g.owner.username}" if g.owner.username else g.owner.label
+        text += f"{i}. {g.title}{num}\n💰 {g.price} ⭐ | 👤 {owner_display}\n🔗 {g.link}\n\n"
 
     await callback.message.answer(text, disable_web_page_preview=True, reply_markup=search_results_keyboard(results))
 
