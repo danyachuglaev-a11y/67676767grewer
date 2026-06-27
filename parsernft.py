@@ -36,8 +36,8 @@ BOT_TOKEN = "8206373294:AAFEHHDDZOdX9i00voiMI55g68gjKjXFZeE"
 ADMIN_ID = 8855434638
 
 # Канал для подписки (если нужен)
-REQUIRED_CHANNEL = "@fcklole"
-REQUIRED_CHANNEL_URL = "https://t.me/fcklole"
+REQUIRED_CHANNEL = "@pupuhop"
+REQUIRED_CHANNEL_URL = "https://t.me/pupuhop"
 
 # ID группы для мониторинга
 MONITOR_CHAT_ID = -1004223195405
