@@ -172,6 +172,10 @@ async def switch_session(session_name: str) -> bool:
         log.error(f"Session {session_name} not found")
         return False
     
+    # Деактивируем все сессии
+    for name in sessions:
+        sessions[name]["active"] = False
+    
     if user_client and user_client.is_connected():
         await user_client.disconnect()
     
@@ -180,10 +184,8 @@ async def switch_session(session_name: str) -> bool:
     
     if await user_client.is_user_authorized():
         active_session_name = session_name
+        sessions[session_name]["active"] = True
         save_active_session(session_name)
-        
-        for name in sessions:
-            sessions[name]["active"] = (name == session_name)
         save_sessions()
         
         log.info(f"Switched to session: {session_name}")
@@ -442,7 +444,7 @@ async def check_sub(callback: CallbackQuery):
         await callback.answer("❌ Подписка не найдена", show_alert=True)
 
 # ==========================
-# АВТОРИЗАЦИЯ СЕССИИ
+# АВТОРИЗАЦИЯ СЕССИИ С АВТОМАТИЧЕСКОЙ АКТИВАЦИЕЙ
 # ==========================
 
 @dp.callback_query(F.data == "add_session_btn")
@@ -548,17 +550,33 @@ async def auth_code(message: Message, state: FSMContext):
         me = await temp_client.get_me()
         name = me.first_name or me.username or str(me.id)
         
+        # Добавляем сессию
         await add_new_session(session_name, phone)
         sessions[session_name]["authorized"] = True
         sessions[session_name]["account_name"] = name
         save_sessions()
         
+        # АВТОМАТИЧЕСКИ АКТИВИРУЕМ СЕССИЮ
         await state.clear()
-        await message.answer(
-            f"✅ Сессия '{session_name}' создана!\n"
-            f"👤 Аккаунт: {name}\n\n"
-            f"Теперь активируйте её в админ-панели."
-        )
+        
+        # Переключаемся на новую сессию
+        success = await switch_session(session_name)
+        
+        if success:
+            # Загружаем модели
+            await load_base_gifts()
+            
+            await message.answer(
+                f"✅ Сессия '{session_name}' создана и АКТИВИРОВАНА!\n"
+                f"👤 Аккаунт: {name}\n\n"
+                f"🎉 Бот готов к работе!"
+            )
+        else:
+            await message.answer(
+                f"✅ Сессия '{session_name}' создана!\n"
+                f"👤 Аккаунт: {name}\n\n"
+                f"⚠️ Но не удалось активировать. Активируйте вручную в админ-панели."
+            )
         
     except SessionPasswordNeededError:
         await state.set_state(AuthState.waiting_password)
@@ -588,17 +606,34 @@ async def auth_password(message: Message, state: FSMContext):
         me = await temp_client.get_me()
         name = me.first_name or me.username or str(me.id)
         
+        # Добавляем сессию
         await add_new_session(session_name, phone)
         sessions[session_name]["authorized"] = True
         sessions[session_name]["account_name"] = name
         save_sessions()
         
+        # АВТОМАТИЧЕСКИ АКТИВИРУЕМ СЕССИЮ
         await state.clear()
-        await message.answer(
-            f"✅ Сессия '{session_name}' создана!\n"
-            f"👤 Аккаунт: {name}\n\n"
-            f"Теперь активируйте её в админ-панели."
-        )
+        
+        # Переключаемся на новую сессию
+        success = await switch_session(session_name)
+        
+        if success:
+            # Загружаем модели
+            await load_base_gifts()
+            
+            await message.answer(
+                f"✅ Сессия '{session_name}' создана и АКТИВИРОВАНА!\n"
+                f"👤 Аккаунт: {name}\n\n"
+                f"🎉 Бот готов к работе!"
+            )
+        else:
+            await message.answer(
+                f"✅ Сессия '{session_name}' создана!\n"
+                f"👤 Аккаунт: {name}\n\n"
+                f"⚠️ Но не удалось активировать. Активируйте вручную в админ-панели."
+            )
+            
     except PasswordHashInvalidError:
         await message.answer("❌ Неверный пароль")
     except Exception as e:
