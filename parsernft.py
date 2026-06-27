@@ -75,6 +75,7 @@ SENT_MONITOR_SLUGS: set = set()
 market_snapshots: Dict[int, Dict[str, Any]] = {}
 PAID_MESSAGES_CACHE: Dict[int, bool] = {}
 OWNER_CACHE: Dict[int, "OwnerInfo"] = {}
+PHONE_CODE_HASH: Dict[str, str] = {}  # session_name -> phone_code_hash
 
 monitor_running = False
 monitor_task = None
@@ -460,7 +461,7 @@ async def check_sub(callback: CallbackQuery):
         await callback.answer("❌ Подписка не найдена", show_alert=True)
 
 # ==========================
-# АВТОРИЗАЦИЯ СЕССИИ
+# АВТОРИЗАЦИЯ СЕССИИ (ИСПРАВЛЕННАЯ)
 # ==========================
 
 @dp.callback_query(F.data == "add_session_btn")
@@ -510,8 +511,12 @@ async def auth_phone(message: Message, state: FSMContext):
     await temp_client.connect()
     
     try:
-        await temp_client.send_code_request(phone)
-        await state.update_data(phone=phone, session_name=session_name)
+        # Сохраняем phone_code_hash
+        result = await temp_client.send_code_request(phone)
+        phone_code_hash = result.phone_code_hash
+        PHONE_CODE_HASH[session_name] = phone_code_hash
+        
+        await state.update_data(phone=phone, session_name=session_name, phone_code_hash=phone_code_hash)
         await state.set_state(AuthState.waiting_code)
         await message.answer(
             f"✅ Код отправлен для сессии {session_name}!\n\n"
@@ -530,13 +535,18 @@ async def auth_code(message: Message, state: FSMContext):
     data = await state.get_data()
     session_name = data.get("session_name")
     phone = data.get("phone")
+    phone_code_hash = data.get("phone_code_hash") or PHONE_CODE_HASH.get(session_name)
     
     # Если пользователь хочет повторно отправить код
     if message.text.strip().lower() in ["resend", "повторно", "ещё"]:
         temp_client = TelegramClient(get_session_file(session_name), API_ID, API_HASH)
         await temp_client.connect()
         try:
-            await temp_client.send_code_request(phone)
+            # Обновляем phone_code_hash при повторной отправке
+            result = await temp_client.send_code_request(phone)
+            new_hash = result.phone_code_hash
+            PHONE_CODE_HASH[session_name] = new_hash
+            await state.update_data(phone_code_hash=new_hash)
             await message.answer(f"✅ Код повторно отправлен для {session_name}!")
         except Exception as e:
             await message.answer(f"❌ Ошибка: {e}")
@@ -553,7 +563,8 @@ async def auth_code(message: Message, state: FSMContext):
     await temp_client.connect()
     
     try:
-        await temp_client.sign_in(phone=phone, code=code)
+        # Передаем phone_code_hash
+        await temp_client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
         
         # Сессия успешно создана
         me = await temp_client.get_me()
@@ -574,6 +585,7 @@ async def auth_code(message: Message, state: FSMContext):
         
     except SessionPasswordNeededError:
         await state.set_state(AuthState.waiting_password)
+        await state.update_data(phone_code_hash=phone_code_hash)
         await message.answer("🔐 Введите пароль от двухфакторной авторизации:")
     except PhoneCodeInvalidError:
         await message.answer("❌ Неверный код\n\nЕсли не приходит, напишите 'resend'")
@@ -589,12 +601,14 @@ async def auth_password(message: Message, state: FSMContext):
     data = await state.get_data()
     session_name = data.get("session_name")
     phone = data.get("phone")
+    phone_code_hash = data.get("phone_code_hash") or PHONE_CODE_HASH.get(session_name)
     password = message.text.strip()
     
     temp_client = TelegramClient(get_session_file(session_name), API_ID, API_HASH)
     await temp_client.connect()
     
     try:
+        # Для 2FA используем sign_in с паролем
         await temp_client.sign_in(password=password)
         me = await temp_client.get_me()
         name = me.first_name or me.username or str(me.id)
