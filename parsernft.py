@@ -75,7 +75,7 @@ SENT_MONITOR_SLUGS: set = set()
 market_snapshots: Dict[int, Dict[str, Any]] = {}
 PAID_MESSAGES_CACHE: Dict[int, bool] = {}
 OWNER_CACHE: Dict[int, "OwnerInfo"] = {}
-PHONE_CODE_HASH: Dict[str, str] = {}  # session_name -> phone_code_hash
+PHONE_CODE_HASH: Dict[str, str] = {}
 
 monitor_running = False
 monitor_task = None
@@ -130,7 +130,6 @@ class AuthState(StatesGroup):
 # ==========================
 
 def load_sessions() -> Dict[str, Dict[str, Any]]:
-    """Загружает список сессий из файла"""
     try:
         with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -138,7 +137,6 @@ def load_sessions() -> Dict[str, Dict[str, Any]]:
         return {}
 
 def save_sessions():
-    """Сохраняет список сессий в файл"""
     try:
         with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
             json.dump(sessions, f, ensure_ascii=False, indent=2)
@@ -146,7 +144,6 @@ def save_sessions():
         pass
 
 def load_active_session() -> Optional[str]:
-    """Загружает имя активной сессии"""
     try:
         with open(ACTIVE_SESSION_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -155,7 +152,6 @@ def load_active_session() -> Optional[str]:
         return None
 
 def save_active_session(name: Optional[str]):
-    """Сохраняет имя активной сессии"""
     try:
         with open(ACTIVE_SESSION_FILE, "w", encoding="utf-8") as f:
             json.dump({"active_session": name}, f, ensure_ascii=False, indent=2)
@@ -163,27 +159,22 @@ def save_active_session(name: Optional[str]):
         pass
 
 def get_session_file(session_name: str) -> str:
-    """Возвращает имя файла сессии"""
     return f"{session_name}.session"
 
 async def create_telethon_client(session_name: str) -> TelegramClient:
-    """Создает клиента Telethon для указанной сессии"""
     session_file = get_session_file(session_name)
     return TelegramClient(session_file, API_ID, API_HASH)
 
 async def switch_session(session_name: str) -> bool:
-    """Переключает на указанную сессию"""
     global user_client, active_session_name
     
     if session_name not in sessions:
         log.error(f"Session {session_name} not found")
         return False
     
-    # Отключаем текущий клиент
     if user_client and user_client.is_connected():
         await user_client.disconnect()
     
-    # Создаем новый клиент
     user_client = await create_telethon_client(session_name)
     await user_client.connect()
     
@@ -191,7 +182,6 @@ async def switch_session(session_name: str) -> bool:
         active_session_name = session_name
         save_active_session(session_name)
         
-        # Обновляем статус в сессиях
         for name in sessions:
             sessions[name]["active"] = (name == session_name)
         save_sessions()
@@ -203,13 +193,11 @@ async def switch_session(session_name: str) -> bool:
         return False
 
 async def init_session_manager():
-    """Инициализирует менеджер сессий"""
     global user_client, active_session_name, sessions
     
     sessions = load_sessions()
     active_session_name = load_active_session()
     
-    # Если есть активная сессия и она существует
     if active_session_name and active_session_name in sessions:
         user_client = await create_telethon_client(active_session_name)
         await user_client.connect()
@@ -223,7 +211,6 @@ async def init_session_manager():
             active_session_name = None
             save_active_session(None)
     
-    # Пытаемся найти первую авторизованную сессию
     for name in sessions:
         if sessions[name].get("authorized", False):
             client = await create_telethon_client(name)
@@ -238,14 +225,12 @@ async def init_session_manager():
                 return True
             await client.disconnect()
     
-    # Если ничего не найдено - создаем дефолтную сессию
     user_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
     await user_client.connect()
     log.info("Using default session")
     return False
 
 async def add_new_session(session_name: str, phone: str) -> bool:
-    """Добавляет новую сессию в список"""
     if session_name in sessions:
         return False
     
@@ -259,11 +244,9 @@ async def add_new_session(session_name: str, phone: str) -> bool:
     return True
 
 async def delete_session(session_name: str) -> bool:
-    """Удаляет сессию"""
     if session_name not in sessions:
         return False
     
-    # Удаляем файл сессии
     session_file = get_session_file(session_name)
     if os.path.exists(session_file):
         try:
@@ -271,18 +254,16 @@ async def delete_session(session_name: str) -> bool:
         except:
             pass
     
-    # Удаляем из списка
     del sessions[session_name]
     save_sessions()
     
-    # Если удалили активную - сбрасываем
     if active_session_name == session_name:
         save_active_session(None)
     
     return True
 
 # ==========================
-# ЗАГРУЗКА/СОХРАНЕНИЕ (остальное)
+# ЗАГРУЗКА/СОХРАНЕНИЕ
 # ==========================
 
 def load_owners_blacklist() -> Dict[str, str]:
@@ -461,7 +442,7 @@ async def check_sub(callback: CallbackQuery):
         await callback.answer("❌ Подписка не найдена", show_alert=True)
 
 # ==========================
-# АВТОРИЗАЦИЯ СЕССИИ (ИСПРАВЛЕННАЯ)
+# АВТОРИЗАЦИЯ СЕССИИ
 # ==========================
 
 @dp.callback_query(F.data == "add_session_btn")
@@ -471,7 +452,8 @@ async def add_session_btn(callback: CallbackQuery, state: FSMContext):
         return
     await callback.message.answer(
         "📱 ДОБАВЛЕНИЕ СЕССИИ\n\n"
-        "Введите название для сессии (например: main, work, bot):"
+        "Введите название для сессии (например: main, work, bot):\n\n"
+        "❌ /cancel — отмена"
     )
     await state.set_state(AuthState.waiting_session_name)
     await callback.answer()
@@ -480,7 +462,7 @@ async def add_session_btn(callback: CallbackQuery, state: FSMContext):
 async def session_name_input(message: Message, state: FSMContext):
     session_name = message.text.strip().replace(" ", "_")
     if not session_name:
-        await message.answer("❌ Название не может быть пустым")
+        await message.answer("❌ Название не может быть пустым\n\nВведите другое имя:")
         return
     
     if session_name in sessions:
@@ -493,7 +475,7 @@ async def session_name_input(message: Message, state: FSMContext):
         f"📱 Сессия: {session_name}\n\n"
         "Введите номер телефона:\n"
         "Пример: +79991234567\n\n"
-        "❌ Отмена — /cancel"
+        "❌ /cancel — отмена"
     )
 
 @dp.message(AuthState.waiting_phone)
@@ -505,13 +487,11 @@ async def auth_phone(message: Message, state: FSMContext):
     data = await state.get_data()
     session_name = data.get("session_name")
     
-    # Создаем временный клиент для авторизации
     session_file = get_session_file(session_name)
     temp_client = TelegramClient(session_file, API_ID, API_HASH)
     await temp_client.connect()
     
     try:
-        # Сохраняем phone_code_hash
         result = await temp_client.send_code_request(phone)
         phone_code_hash = result.phone_code_hash
         PHONE_CODE_HASH[session_name] = phone_code_hash
@@ -521,7 +501,8 @@ async def auth_phone(message: Message, state: FSMContext):
         await message.answer(
             f"✅ Код отправлен для сессии {session_name}!\n\n"
             "Введите код из Telegram:\n"
-            "Если не приходит — напишите 'resend'"
+            "Если не приходит — напишите 'resend'\n\n"
+            "❌ /cancel — отмена"
         )
     except PhoneNumberInvalidError:
         await message.answer("❌ Неверный номер")
@@ -542,12 +523,11 @@ async def auth_code(message: Message, state: FSMContext):
         temp_client = TelegramClient(get_session_file(session_name), API_ID, API_HASH)
         await temp_client.connect()
         try:
-            # Обновляем phone_code_hash при повторной отправке
             result = await temp_client.send_code_request(phone)
             new_hash = result.phone_code_hash
             PHONE_CODE_HASH[session_name] = new_hash
             await state.update_data(phone_code_hash=new_hash)
-            await message.answer(f"✅ Код повторно отправлен для {session_name}!")
+            await message.answer(f"✅ Код повторно отправлен для {session_name}!\n\nВведите код:")
         except Exception as e:
             await message.answer(f"❌ Ошибка: {e}")
         finally:
@@ -556,21 +536,18 @@ async def auth_code(message: Message, state: FSMContext):
     
     code = "".join(ch for ch in message.text.strip() if ch.isdigit())
     if len(code) < 4:
-        await message.answer("❌ Код слишком короткий\n\nЕсли не приходит, напишите 'resend'")
+        await message.answer("❌ Код слишком короткий\n\nЕсли не приходит, напишите 'resend'\n\n❌ /cancel — отмена")
         return
     
     temp_client = TelegramClient(get_session_file(session_name), API_ID, API_HASH)
     await temp_client.connect()
     
     try:
-        # Передаем phone_code_hash
         await temp_client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
         
-        # Сессия успешно создана
         me = await temp_client.get_me()
         name = me.first_name or me.username or str(me.id)
         
-        # Добавляем в список сессий
         await add_new_session(session_name, phone)
         sessions[session_name]["authorized"] = True
         sessions[session_name]["account_name"] = name
@@ -586,7 +563,7 @@ async def auth_code(message: Message, state: FSMContext):
     except SessionPasswordNeededError:
         await state.set_state(AuthState.waiting_password)
         await state.update_data(phone_code_hash=phone_code_hash)
-        await message.answer("🔐 Введите пароль от двухфакторной авторизации:")
+        await message.answer("🔐 Введите пароль от двухфакторной авторизации:\n\n❌ /cancel — отмена")
     except PhoneCodeInvalidError:
         await message.answer("❌ Неверный код\n\nЕсли не приходит, напишите 'resend'")
     except PhoneCodeExpiredError:
@@ -601,14 +578,12 @@ async def auth_password(message: Message, state: FSMContext):
     data = await state.get_data()
     session_name = data.get("session_name")
     phone = data.get("phone")
-    phone_code_hash = data.get("phone_code_hash") or PHONE_CODE_HASH.get(session_name)
     password = message.text.strip()
     
     temp_client = TelegramClient(get_session_file(session_name), API_ID, API_HASH)
     await temp_client.connect()
     
     try:
-        # Для 2FA используем sign_in с паролем
         await temp_client.sign_in(password=password)
         me = await temp_client.get_me()
         name = me.first_name or me.username or str(me.id)
@@ -636,7 +611,6 @@ async def auth_password(message: Message, state: FSMContext):
 # ==========================
 
 def sessions_list_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура со списком сессий"""
     rows = []
     for name, data in sessions.items():
         status = "✅" if data.get("active", False) else "⏸️"
@@ -650,11 +624,11 @@ def sessions_list_keyboard() -> InlineKeyboardMarkup:
         ])
     
     rows.append([InlineKeyboardButton(text="➕ ДОБАВИТЬ СЕССИЮ", callback_data="add_session_btn")])
+    rows.append([InlineKeyboardButton(text="🔙 НАЗАД", callback_data="admin_panel")])
     rows.append([InlineKeyboardButton(text="🏠 ГЛАВНОЕ", callback_data="menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def session_actions_keyboard(session_name: str) -> InlineKeyboardMarkup:
-    """Клавиатура действий для сессии"""
     is_active = sessions.get(session_name, {}).get("active", False)
     is_authorized = sessions.get(session_name, {}).get("authorized", False)
     
@@ -682,6 +656,7 @@ async def sessions_list(callback: CallbackQuery):
             "Нажми ➕ ДОБАВИТЬ СЕССИЮ для создания",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="➕ ДОБАВИТЬ СЕССИЮ", callback_data="add_session_btn")],
+                [InlineKeyboardButton(text="🔙 НАЗАД", callback_data="admin_panel")],
                 [InlineKeyboardButton(text="🏠 ГЛАВНОЕ", callback_data="menu")]
             ])
         )
@@ -794,7 +769,6 @@ async def session_delete(callback: CallbackQuery):
     
     session_name = callback.data.split(":", 1)[1]
     
-    # Подтверждение удаления
     await callback.message.edit_text(
         f"⚠️ УДАЛИТЬ СЕССИЮ?\n\n"
         f"Сессия: {session_name}\n"
@@ -820,7 +794,7 @@ async def session_confirm_delete(callback: CallbackQuery):
     await sessions_list(callback)
 
 # ==========================
-# АДМИН-ПАНЕЛЬ (ОБНОВЛЕННАЯ)
+# АДМИН-ПАНЕЛЬ
 # ==========================
 
 @dp.callback_query(F.data == "admin_panel")
@@ -935,14 +909,12 @@ async def ensure_models_loaded():
 # ==========================
 
 async def resolve_owner_info(raw_gift: Any) -> OwnerInfo:
-    # Проверяем кеш
     owner_id = get_field(raw_gift, "owner_id")
     user_id = extract_user_id(owner_id) if owner_id else None
     
     if user_id and user_id in OWNER_CACHE:
         return OWNER_CACHE[user_id]
     
-    # Сначала проверяем, есть ли username напрямую в ответе
     direct_username = get_field(raw_gift, "owner_username") or get_field(raw_gift, "username")
     if direct_username:
         username = str(direct_username).lstrip("@")
@@ -957,7 +929,6 @@ async def resolve_owner_info(raw_gift: Any) -> OwnerInfo:
                 OWNER_CACHE[user_id] = info
             return info
     
-    # Если нет - пытаемся получить через owner_id
     if user_id and user_client:
         try:
             await ensure_user_client_connected()
@@ -1217,6 +1188,7 @@ def monitor_admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="▶️ ЗАПУСТИТЬ", callback_data="monitor_start")] if not monitor_running else [],
         [InlineKeyboardButton(text="⏹️ ОСТАНОВИТЬ", callback_data="monitor_stop")] if monitor_running else [],
         [InlineKeyboardButton(text="🔄 СБРОСИТЬ ИСТОРИЮ", callback_data="monitor_reset")],
+        [InlineKeyboardButton(text="🔙 НАЗАД", callback_data="admin_panel")],
         [InlineKeyboardButton(text="🏠 ГЛАВНОЕ", callback_data="menu")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=[b for b in buttons if b])
@@ -1399,7 +1371,12 @@ async def monitor_status(callback: CallbackQuery):
 @dp.callback_query(F.data == "owners_blacklist")
 async def show_blacklist(callback: CallbackQuery):
     if not OWNERS_BLACKLIST:
-        await callback.message.edit_text("🚫 Чёрный список пуст", reply_markup=main_menu_keyboard(callback.from_user.id))
+        await callback.message.edit_text(
+            "🚫 Чёрный список пуст",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🏠 ГЛАВНОЕ", callback_data="menu")]
+            ])
+        )
         await callback.answer()
         return
     text = "🚫 ЧЁРНЫЙ СПИСОК\n\n"
@@ -1475,14 +1452,43 @@ async def cmd_start(message: Message):
         "⚙️ АДМИН-ПАНЕЛЬ — управление ботом\n"
         "📡 МОНИТОРИНГ — автоотслеживание новых подарков\n\n"
         "📌 Пример цены: 500 800\n"
-        "💰 Цены в звездах",
+        "💰 Цены в звездах\n\n"
+        "❌ /cancel — отмена действия\n"
+        "🏠 /menu — главное меню",
+        reply_markup=main_menu_keyboard(message.from_user.id)
+    )
+
+@dp.message(Command("menu"))
+async def cmd_menu(message: Message):
+    if not await ensure_access(message):
+        return
+    
+    is_auth = await is_user_client_authorized()
+    
+    if not is_auth:
+        if is_admin_user(message.from_user.id):
+            await message.answer(
+                "⚠️ Нет активной сессии!\n\n"
+                "Зайдите в АДМИН-ПАНЕЛЬ → УПРАВЛЕНИЕ СЕССИЯМИ",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⚙️ АДМИН-ПАНЕЛЬ", callback_data="admin_panel")]
+                ])
+            )
+        else:
+            await message.answer("⚠️ Бот настраивается. Подождите.")
+        return
+    
+    await message.answer(
+        "🎁 ГЛАВНОЕ МЕНЮ\n\n"
+        "Выберите действие:",
         reply_markup=main_menu_keyboard(message.from_user.id)
     )
 
 @dp.callback_query(F.data == "menu")
 async def menu(callback: CallbackQuery):
     await callback.message.edit_text(
-        "🎁 ГЛАВНОЕ МЕНЮ",
+        "🎁 ГЛАВНОЕ МЕНЮ\n\n"
+        "Выберите действие:",
         reply_markup=main_menu_keyboard(callback.from_user.id)
     )
     await callback.answer()
@@ -1513,9 +1519,19 @@ async def select_gift(callback: CallbackQuery):
         f"✅ {gift.title}\n"
         f"💰 Мин.цена: {gift.resell_min_stars or 0}⭐\n"
         f"📦 Доступно: {gift.availability_resale} шт.\n\n"
-        f"📝 Отправь диапазон цен: 500 800"
+        f"📝 Отправь диапазон цен: 500 800\n\n"
+        f"❌ /cancel — отмена"
     )
     await callback.answer()
+
+@dp.message(Command("cancel"))
+async def cancel_cmd(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is not None:
+        await state.clear()
+        await message.answer("❌ Действие отменено\n\n🏠 /menu — главное меню")
+    else:
+        await message.answer("❌ Нет активных действий\n\n🏠 /menu — главное меню")
 
 @dp.message()
 async def price_handler(message: Message):
@@ -1525,7 +1541,7 @@ async def price_handler(message: Message):
 
     parts = message.text.strip().replace("-", " ").split()
     if len(parts) != 2:
-        await message.answer("❌ Отправь два числа: мин и макс\nПример: 500 800")
+        await message.answer("❌ Отправь два числа: мин и макс\nПример: 500 800\n\n❌ /cancel — отмена")
         return
 
     try:
@@ -1533,7 +1549,7 @@ async def price_handler(message: Message):
         if min_p < 0 or max_p < 0 or min_p > max_p:
             raise ValueError
     except:
-        await message.answer("❌ Введи корректные числа")
+        await message.answer("❌ Введи корректные числа\n\n❌ /cancel — отмена")
         return
 
     gift_id = USER_SELECTED_GIFT.pop(user_id)
@@ -1563,7 +1579,7 @@ async def price_handler(message: Message):
     await status.delete()
 
     if not results:
-        await message.answer(f"❌ По модели {base.title} ничего не найдено в диапазоне {min_p}-{max_p} ⭐")
+        await message.answer(f"❌ По модели {base.title} ничего не найдено в диапазоне {min_p}-{max_p} ⭐\n\n🏠 /menu — главное меню")
         return
 
     text = f"🎁 {base.title} | {min_p}-{max_p} ⭐\n└ Найдено: {len(results)}\n\n"
@@ -1610,7 +1626,7 @@ async def repeat_search(callback: CallbackQuery):
     await callback.message.delete()
 
     if not results:
-        await callback.message.answer(f"❌ По модели {base.title} ничего не найдено в диапазоне {min_p}-{max_p} ⭐")
+        await callback.message.answer(f"❌ По модели {base.title} ничего не найдено в диапазоне {min_p}-{max_p} ⭐\n\n🏠 /menu — главное меню")
         return
 
     text = f"🎁 {base.title} | {min_p}-{max_p} ⭐\n└ Найдено: {len(results)}\n\n"
@@ -1632,11 +1648,6 @@ async def clear_seen(callback: CallbackQuery):
     await callback.answer("🧹 Сброшено")
     await callback.message.edit_text("🧹 История сброшена", reply_markup=main_menu_keyboard(user_id))
 
-@dp.message(Command("cancel"))
-async def cancel_cmd(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("❌ Отменено")
-
 # ==========================
 # ЗАПУСК
 # ==========================
@@ -1651,7 +1662,6 @@ async def main():
 
     log.info(f"Loaded: blacklist={len(OWNERS_BLACKLIST)}, seen={len(SEEN_GIFTS_BY_QUERY)}, monitor={len(SENT_MONITOR_SLUGS)}, snapshots={len(market_snapshots)}")
 
-    # Инициализируем менеджер сессий
     await init_session_manager()
 
     if await is_user_client_authorized():
