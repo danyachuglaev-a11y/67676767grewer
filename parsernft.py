@@ -5,6 +5,8 @@ import json
 import logging
 import random
 import re
+import sqlite3
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -55,6 +57,7 @@ OWNERS_BLACKLIST_FILE = "owners_blacklist.json"
 SEEN_GIFTS_FILE = "seen_gifts.json"
 SENT_MONITOR_SLUGS_FILE = "sent_monitor_slugs.json"
 SETTINGS_FILE = "bot_settings.json"
+DB_FILE = "gift_parser.db"
 
 # ==========================
 
@@ -170,14 +173,26 @@ def save_settings(settings: dict):
 
 def load_owners_blacklist() -> Dict[str, str]:
     try:
+        data = db_load_owners_blacklist()
+        if data:
+            return data
+    except Exception as e:
+        log.debug(f"DB blacklist load failed: {e}")
+    try:
         with open(OWNERS_BLACKLIST_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            return {str(k): str(v) for k, v in data.items()}
+            data = {str(k): str(v) for k, v in data.items()}
+            db_save_owners_blacklist(data)
+            return data
     except:
         return {}
 
 
 def save_owners_blacklist():
+    try:
+        db_save_owners_blacklist(OWNERS_BLACKLIST)
+    except Exception as e:
+        log.debug(f"DB blacklist save failed: {e}")
     try:
         with open(OWNERS_BLACKLIST_FILE, "w", encoding="utf-8") as f:
             json.dump(OWNERS_BLACKLIST, f, ensure_ascii=False, indent=2)
@@ -187,14 +202,28 @@ def save_owners_blacklist():
 
 def load_seen_gifts() -> Dict[str, List[str]]:
     try:
+        data = db_load_seen_gifts()
+        if data:
+            return data
+    except Exception as e:
+        log.debug(f"DB seen load failed: {e}")
+    try:
         with open(SEEN_GIFTS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            return {str(k): [str(x) for x in v] for k, v in data.items() if isinstance(v, list)}
+            data = {str(k): [str(x) for x in v] for k, v in data.items() if isinstance(v, list)}
+            for q, slugs in data.items():
+                db_save_seen_query(q, slugs)
+            return data
     except:
         return {}
 
 
 def save_seen_gifts():
+    try:
+        for q, slugs in SEEN_GIFTS_BY_QUERY.items():
+            db_save_seen_query(q, slugs)
+    except Exception as e:
+        log.debug(f"DB seen save failed: {e}")
     try:
         with open(SEEN_GIFTS_FILE, "w", encoding="utf-8") as f:
             json.dump(SEEN_GIFTS_BY_QUERY, f, ensure_ascii=False, indent=2)
@@ -204,19 +233,96 @@ def save_seen_gifts():
 
 def load_sent_monitor_slugs() -> set:
     try:
+        data = db_load_monitor_slugs()
+        if data:
+            return data
+    except Exception as e:
+        log.debug(f"DB monitor load failed: {e}")
+    try:
         with open(SENT_MONITOR_SLUGS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            return set(data) if isinstance(data, list) else set()
+            data = set(data) if isinstance(data, list) else set()
+            db_save_monitor_slugs(data)
+            return data
     except:
         return set()
 
 
 def save_sent_monitor_slugs(slugs: set):
     try:
+        db_save_monitor_slugs(slugs)
+    except Exception as e:
+        log.debug(f"DB monitor save failed: {e}")
+    try:
         with open(SENT_MONITOR_SLUGS_FILE, "w", encoding="utf-8") as f:
             json.dump(list(slugs), f, ensure_ascii=False, indent=2)
     except:
         pass
+
+
+def init_db():
+    """SQLite-хранилище: устойчивее JSON и не теряет историю при рестартах."""
+    with sqlite3.connect(DB_FILE) as con:
+        con.execute("CREATE TABLE IF NOT EXISTS owners_blacklist (key TEXT PRIMARY KEY, label TEXT NOT NULL)")
+        con.execute("CREATE TABLE IF NOT EXISTS seen_gifts (query_key TEXT NOT NULL, slug TEXT NOT NULL, seen_at INTEGER NOT NULL, PRIMARY KEY(query_key, slug))")
+        con.execute("CREATE TABLE IF NOT EXISTS monitor_slugs (slug TEXT PRIMARY KEY, seen_at INTEGER NOT NULL)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_seen_query ON seen_gifts(query_key)")
+        con.commit()
+
+
+def db_load_owners_blacklist() -> Dict[str, str]:
+    init_db()
+    with sqlite3.connect(DB_FILE) as con:
+        return {str(k): str(v) for k, v in con.execute("SELECT key, label FROM owners_blacklist")}
+
+
+def db_save_owners_blacklist(data: Dict[str, str]):
+    init_db()
+    with sqlite3.connect(DB_FILE) as con:
+        con.execute("DELETE FROM owners_blacklist")
+        con.executemany("INSERT OR REPLACE INTO owners_blacklist(key, label) VALUES(?, ?)", data.items())
+        con.commit()
+
+
+def db_load_seen_gifts() -> Dict[str, List[str]]:
+    init_db()
+    result: Dict[str, List[str]] = {}
+    with sqlite3.connect(DB_FILE) as con:
+        for query_key, slug in con.execute("SELECT query_key, slug FROM seen_gifts ORDER BY seen_at ASC"):
+            result.setdefault(str(query_key), []).append(str(slug))
+    return result
+
+
+def db_save_seen_query(query_key: str, slugs: List[str]):
+    init_db()
+    now = int(time.time())
+    with sqlite3.connect(DB_FILE) as con:
+        con.executemany(
+            "INSERT OR IGNORE INTO seen_gifts(query_key, slug, seen_at) VALUES(?, ?, ?)",
+            [(query_key, slug, now) for slug in slugs],
+        )
+        con.commit()
+
+
+def db_clear_seen_query(query_key: str):
+    init_db()
+    with sqlite3.connect(DB_FILE) as con:
+        con.execute("DELETE FROM seen_gifts WHERE query_key = ?", (query_key,))
+        con.commit()
+
+
+def db_load_monitor_slugs() -> set:
+    init_db()
+    with sqlite3.connect(DB_FILE) as con:
+        return {str(row[0]) for row in con.execute("SELECT slug FROM monitor_slugs")}
+
+
+def db_save_monitor_slugs(slugs: set):
+    init_db()
+    now = int(time.time())
+    with sqlite3.connect(DB_FILE) as con:
+        con.executemany("INSERT OR IGNORE INTO monitor_slugs(slug, seen_at) VALUES(?, ?)", [(slug, now) for slug in slugs])
+        con.commit()
 
 
 # ==========================
@@ -269,6 +375,20 @@ class AuthState(StatesGroup):
     waiting_password = State()
 
 
+async def recreate_user_client():
+    """Пересоздаёт Telethon-клиент без рестарта бота/хостинга."""
+    global user_client, BASE_GIFTS, BASE_GIFTS_BY_ID
+    try:
+        if user_client.is_connected():
+            await user_client.disconnect()
+    except Exception:
+        pass
+    user_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+    BASE_GIFTS = []
+    BASE_GIFTS_BY_ID = {}
+    await user_client.connect()
+
+
 async def ensure_user_client_connected():
     if not user_client.is_connected():
         await user_client.connect()
@@ -279,6 +399,24 @@ async def is_user_client_authorized() -> bool:
     return await user_client.is_user_authorized()
 
 
+@dp.message(Command("relogin"))
+async def relogin_command(message: Message, state: FSMContext):
+    """Принудительно добавить/обновить сессию без перезапуска бота."""
+    if not is_admin_user(message.from_user.id):
+        await message.answer("⛔ Только для администратора")
+        return
+    await state.clear()
+    await recreate_user_client()
+    await state.set_state(AuthState.waiting_phone)
+    await message.answer(
+        "🔁 *ПЕРЕПОДКЛЮЧЕНИЕ СЕССИИ*\n\n"
+        "Бот не перезапускается. Введите номер телефона в международном формате:\n"
+        "Пример: `+79991234567`\n\n"
+        "❌ Отмена — /cancel",
+        parse_mode="Markdown"
+    )
+
+
 @dp.message(Command("add_session"))
 async def add_session_command(message: Message, state: FSMContext):
     """Только админ может добавить сессию"""
@@ -287,7 +425,7 @@ async def add_session_command(message: Message, state: FSMContext):
         return
     
     if await is_user_client_authorized():
-        await message.answer("✅ Сессия уже добавлена. Бот работает.")
+        await message.answer("✅ Сессия уже добавлена. Если хочешь заменить её без рестарта, используй /relogin")
         return
     
     await state.set_state(AuthState.waiting_phone)
@@ -376,6 +514,7 @@ async def finish_auth_success(message: Message):
     )
     
     await load_base_gifts()
+    await start_monitor_if_needed()
     
     await message.answer(
         f"✅ *Готово!*\n\n"
@@ -391,31 +530,49 @@ async def finish_auth_success(message: Message):
 # ==========================
 
 async def load_base_gifts() -> List[BaseGift]:
+    """
+    Загружает базовые модели подарков.
+
+    Важно: нельзя отбрасывать модель только потому, что availability_resale пустой/0/None.
+    У части подарков Telegram может не вернуть это поле, из-за чего старый код грузил 0 моделей.
+    """
     global BASE_GIFTS, BASE_GIFTS_BY_ID
     log.info("Loading base star gifts...")
+
     result = await user_client(functions.payments.GetStarGiftsRequest(hash=0))
     raw_gifts = getattr(result, "gifts", []) or []
-    gifts = []
+    log.info("Raw gifts received: %s", len(raw_gifts))
+
+    gifts: List[BaseGift] = []
+    skipped = 0
+
     for raw in raw_gifts:
         gift_id = safe_int(get_field(raw, "id"))
         title = get_field(raw, "title")
+
         if not gift_id or not title:
+            skipped += 1
             continue
-        availability_resale = get_field(raw, "availability_resale")
-        if not availability_resale:
-            continue
+
+        availability_resale = safe_int(get_field(raw, "availability_resale"), 0)
+        resell_min_stars = safe_int(get_field(raw, "resell_min_stars"), 0)
+        stars = safe_int(get_field(raw, "stars"), 0)
+
         gifts.append(BaseGift(
             gift_id=gift_id,
             title=str(title),
-            stars=get_field(raw, "stars"),
-            availability_resale=safe_int(availability_resale),
-            resell_min_stars=safe_int(get_field(raw, "resell_min_stars")),
+            stars=stars,
+            availability_resale=availability_resale,
+            resell_min_stars=resell_min_stars,
             sold_out=get_field(raw, "sold_out"),
         ))
+
     gifts.sort(key=lambda g: (g.resell_min_stars or 999999, g.title.lower()))
+
     BASE_GIFTS = gifts
     BASE_GIFTS_BY_ID = {g.gift_id: g for g in gifts}
-    log.info("Loaded %s base gifts", len(gifts))
+
+    log.info("Loaded %s base gifts, skipped %s", len(gifts), skipped)
     return gifts
 
 
@@ -475,15 +632,20 @@ def get_seen_slugs(gift_id: int, min_stars: int, max_stars: int) -> set:
 def remember_seen_results(gift_id: int, min_stars: int, max_stars: int, results: List[MarketGift]):
     key = f"{gift_id}:{min_stars}:{max_stars}"
     old = set(SEEN_GIFTS_BY_QUERY.get(key, []))
+    fresh = []
     for gift in results:
         if gift.slug not in old:
             SEEN_GIFTS_BY_QUERY.setdefault(key, []).append(gift.slug)
-    save_seen_gifts()
+            fresh.append(gift.slug)
+    if fresh:
+        db_save_seen_query(key, fresh)
+        save_seen_gifts()
 
 
 def clear_seen_for_query(gift_id: int, min_stars: int, max_stars: int):
     key = f"{gift_id}:{min_stars}:{max_stars}"
     SEEN_GIFTS_BY_QUERY.pop(key, None)
+    db_clear_seen_query(key)
     save_seen_gifts()
 
 
@@ -655,6 +817,18 @@ async def owner_passes_profile_filters(owner_id: Optional[int], owner: OwnerInfo
         return True
 
 
+async def throttle_model_request(model_key: str):
+    delay = safe_int(bot_settings.get("delay_between_batches", DELAY_BETWEEN_BATCHES), DELAY_BETWEEN_BATCHES)
+    if delay <= 0:
+        return
+    now = time.time()
+    last = last_send_time_by_model.get(model_key, 0)
+    wait_for = delay - (now - last)
+    if wait_for > 0:
+        await asyncio.sleep(wait_for)
+    last_send_time_by_model[model_key] = time.time()
+
+
 async def find_market_gifts(
     gift_id: int,
     min_stars: int,
@@ -667,8 +841,10 @@ async def find_market_gifts(
     offset = ""
     pages = 0
 
+    model_key = str(gift_id)
     while len(found) < need and pages < MAX_MARKET_PAGES:
         pages += 1
+        await throttle_model_request(model_key)
         try:
             result = await user_client(
                 functions.payments.GetResaleStarGiftsRequest(
@@ -973,6 +1149,13 @@ async def noop(callback: CallbackQuery):
 # МОНИТОРИНГ
 # ==========================
 
+async def start_monitor_if_needed():
+    global monitor_running, monitor_task
+    if MONITOR_CHAT_ID and not monitor_running and await is_user_client_authorized():
+        monitor_running = True
+        monitor_task = asyncio.create_task(monitor_worker())
+
+
 async def monitor_worker():
     global monitor_running, SENT_MONITOR_SLUGS
     while monitor_running:
@@ -1267,9 +1450,7 @@ async def main():
             log.info(f"Models loaded: {len(BASE_GIFTS)}")
         except Exception as e:
             log.error(f"Models load error: {e}")
-        if MONITOR_CHAT_ID:
-            monitor_running = True
-            monitor_task = asyncio.create_task(monitor_worker())
+        await start_monitor_if_needed()
     else:
         log.info("Telethon not authorized. Admin must run /add_session")
 
