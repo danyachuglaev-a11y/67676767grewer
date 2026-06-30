@@ -40,7 +40,7 @@ REQUIRED_CHANNEL = "@pupuhop"
 REQUIRED_CHANNEL_URL = "https://t.me/pupuhop"
 
 # ID группы для мониторинга
-MONITOR_CHAT_ID = -1004223195405
+MONITOR_CHAT_ID = -1005566054184
 MONITOR_INTERVAL = 60
 
 # ==========================
@@ -89,12 +89,25 @@ monitor_task = None
 bot_settings = {
     "links_per_message": 10,
     "delay_between_batches": 30,
+    "skip_arabic_profiles": True,
+    "max_owner_gifts": 5,
+    "girls_only": False,
+    "monitor_new_only": True,
 }
 LINKS_PER_MESSAGE = bot_settings["links_per_message"]
 DELAY_BETWEEN_BATCHES = bot_settings["delay_between_batches"]
 last_send_time_by_model: Dict[str, float] = {}
 
 PAID_MESSAGES_CACHE: Dict[int, bool] = {}
+OWNER_GIFTS_COUNT_CACHE: Dict[int, int] = {}
+PROFILE_FILTER_CACHE: Dict[int, bool] = {}
+
+ARABIC_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]")
+GIRL_NAME_RE = re.compile(
+    r"\b(девочка|девушка|она|girl|female|woman|lady|princess|queen|baby|miss|her)\b",
+    re.IGNORECASE,
+)
+
 
 
 @dataclass
@@ -544,6 +557,104 @@ async def has_paid_messages_enabled(user_id: int) -> bool:
         return False
 
 
+
+def text_has_arabic(text: Optional[str]) -> bool:
+    return bool(text and ARABIC_RE.search(str(text)))
+
+
+def looks_like_girl_profile(entity: Any, full_user: Any = None) -> bool:
+    """Telegram не отдаёт пол пользователя, поэтому это только эвристика по имени/био."""
+    parts = [
+        getattr(entity, "first_name", "") or "",
+        getattr(entity, "last_name", "") or "",
+        getattr(entity, "username", "") or "",
+    ]
+    about = getattr(getattr(full_user, "full_user", None), "about", "") if full_user else ""
+    if about:
+        parts.append(about)
+    text = " ".join(parts).lower()
+    if GIRL_NAME_RE.search(text):
+        return True
+    first_name = (getattr(entity, "first_name", "") or "").strip().lower()
+    # Очень мягкая эвристика для рус/укр/англ имён: часто женские имена заканчиваются на -а/-я/-ia/-na.
+    return bool(first_name and (first_name.endswith(("а", "я", "ia", "na", "ie", "elle"))))
+
+
+async def get_owner_profile_gifts_count(user_id: int, max_allowed: int) -> int:
+    """Возвращает количество подарков в профиле, считая только до max_allowed + 1."""
+    if user_id in OWNER_GIFTS_COUNT_CACHE:
+        return OWNER_GIFTS_COUNT_CACHE[user_id]
+    try:
+        peer = await user_client.get_input_entity(user_id)
+        req_cls = getattr(functions.payments, "GetSavedStarGiftsRequest", None)
+        if not req_cls:
+            # На старой версии Telethon метода может не быть — не режем владельца вслепую.
+            OWNER_GIFTS_COUNT_CACHE[user_id] = 0
+            return 0
+        kwargs = dict(peer=peer, offset="", limit=max_allowed + 1)
+        sig = inspect.signature(req_cls)
+        for optional_flag in ("exclude_unsaved", "exclude_saved", "exclude_unlimited", "exclude_limited", "exclude_unique", "sort_by_value"):
+            if optional_flag in sig.parameters:
+                kwargs[optional_flag] = False
+        result = await user_client(req_cls(**kwargs))
+        gifts = getattr(result, "gifts", []) or []
+        count = len(gifts)
+        OWNER_GIFTS_COUNT_CACHE[user_id] = count
+        return count
+    except Exception as e:
+        log.debug(f"Owner gifts count check failed for {user_id}: {e}")
+        OWNER_GIFTS_COUNT_CACHE[user_id] = 0
+        return 0
+
+
+async def owner_passes_profile_filters(owner_id: Optional[int], owner: OwnerInfo) -> bool:
+    if not owner_id:
+        return True
+    if owner_id in PROFILE_FILTER_CACHE:
+        return PROFILE_FILTER_CACHE[owner_id]
+
+    skip_arabic = bool(bot_settings.get("skip_arabic_profiles", True))
+    max_owner_gifts = safe_int(bot_settings.get("max_owner_gifts", 5), 5)
+    girls_only = bool(bot_settings.get("girls_only", False))
+
+    try:
+        entity = await user_client.get_entity(owner_id)
+        full_user = None
+        try:
+            full_user = await user_client(functions.users.GetFullUserRequest(id=owner_id))
+        except Exception:
+            full_user = None
+
+        profile_text = " ".join(filter(None, [
+            getattr(entity, "first_name", "") or "",
+            getattr(entity, "last_name", "") or "",
+            getattr(entity, "username", "") or "",
+            owner.label or "",
+            getattr(getattr(full_user, "full_user", None), "about", "") if full_user else "",
+        ]))
+
+        if skip_arabic and text_has_arabic(profile_text):
+            PROFILE_FILTER_CACHE[owner_id] = False
+            return False
+
+        if max_owner_gifts >= 0:
+            gifts_count = await get_owner_profile_gifts_count(owner_id, max_owner_gifts)
+            if gifts_count > max_owner_gifts:
+                PROFILE_FILTER_CACHE[owner_id] = False
+                return False
+
+        if girls_only and not looks_like_girl_profile(entity, full_user):
+            PROFILE_FILTER_CACHE[owner_id] = False
+            return False
+
+        PROFILE_FILTER_CACHE[owner_id] = True
+        return True
+    except Exception as e:
+        log.debug(f"Profile filter failed for {owner_id}: {e}")
+        PROFILE_FILTER_CACHE[owner_id] = True
+        return True
+
+
 async def find_market_gifts(
     gift_id: int,
     min_stars: int,
@@ -598,6 +709,10 @@ async def find_market_gifts(
             owner_id = extract_user_id(owner_id_raw)
             if owner_id and await has_paid_messages_enabled(owner_id):
                 log.debug(f"Skipping {slug} - owner requires stars to message")
+                continue
+
+            if not await owner_passes_profile_filters(owner_id, owner):
+                log.debug(f"Skipping {slug} - owner did not pass profile filters")
                 continue
             
             found.append(
@@ -662,11 +777,12 @@ async def send_search_results(
 
 def main_menu_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text="📦 ВЫБРАТЬ МОДЕЛЬ", callback_data="models:0")],
-        [InlineKeyboardButton(text="🚫 ЧЁРНЫЙ СПИСОК", callback_data="owners_blacklist")],
+        [InlineKeyboardButton(text="🎁 Искать подарки", callback_data="models:0")],
+        [InlineKeyboardButton(text="⚙️ Фильтры", callback_data="filters_panel")],
+        [InlineKeyboardButton(text="🚫 Чёрный список", callback_data="owners_blacklist")],
     ]
     if MONITOR_CHAT_ID and is_admin_user(user_id):
-        rows.insert(1, [InlineKeyboardButton(text="📡 МОНИТОРИНГ", callback_data="monitor_admin_panel")])
+        rows.insert(2, [InlineKeyboardButton(text="📡 Новые листинги", callback_data="monitor_admin_panel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -714,6 +830,27 @@ def blacklist_keyboard() -> InlineKeyboardMarkup:
     if rows:
         rows.append([InlineKeyboardButton(text="🧹 ОЧИСТИТЬ ВСЁ", callback_data="clear_owners_blacklist")])
     rows.append([InlineKeyboardButton(text="🏠 ГЛАВНОЕ", callback_data="menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+
+def bool_badge(value: bool) -> str:
+    return "✅" if value else "❌"
+
+
+def filters_keyboard() -> InlineKeyboardMarkup:
+    max_gifts = bot_settings.get("max_owner_gifts", 5)
+    rows = [
+        [InlineKeyboardButton(text=f"{bool_badge(bot_settings.get('skip_arabic_profiles', True))} Пропускать арабские символы", callback_data="toggle_filter:skip_arabic_profiles")],
+        [InlineKeyboardButton(text=f"🎁 Подарков в профиле: до {max_gifts}", callback_data="noop")],
+        [
+            InlineKeyboardButton(text="➖", callback_data="max_gifts:dec"),
+            InlineKeyboardButton(text="➕", callback_data="max_gifts:inc"),
+        ],
+        [InlineKeyboardButton(text=f"{bool_badge(bot_settings.get('girls_only', False))} Искать только девочек", callback_data="toggle_filter:girls_only")],
+        [InlineKeyboardButton(text=f"{bool_badge(bot_settings.get('monitor_new_only', True))} Мониторить только новые", callback_data="toggle_filter:monitor_new_only")],
+        [InlineKeyboardButton(text="🏠 Главное", callback_data="menu")],
+    ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -786,6 +923,52 @@ async def clear_blacklist(callback: CallbackQuery):
     await show_blacklist(callback)
 
 
+
+@dp.callback_query(F.data == "filters_panel")
+async def filters_panel(callback: CallbackQuery):
+    text = (
+        "⚙️ *ФИЛЬТРЫ ПОИСКА*\n\n"
+        "• арабские символы — пропускает владельцев, если в имени/юзернейме/био есть арабская письменность;\n"
+        "• подарков в профиле — пропускает владельцев, у которых больше лимита;\n"
+        "• только девочки — примерная эвристика по имени/био, Telegram не отдаёт пол напрямую;\n"
+        "• только новые — мониторинг отправляет только ещё не отправленные листинги."
+    )
+    await callback.message.edit_text(text, reply_markup=filters_keyboard(), parse_mode="Markdown")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("toggle_filter:"))
+async def toggle_filter(callback: CallbackQuery):
+    key = callback.data.split(":", 1)[1]
+    if key not in {"skip_arabic_profiles", "girls_only", "monitor_new_only"}:
+        await callback.answer("Неизвестный фильтр")
+        return
+    bot_settings[key] = not bool(bot_settings.get(key, False))
+    save_settings(bot_settings)
+    PROFILE_FILTER_CACHE.clear()
+    await filters_panel(callback)
+
+
+@dp.callback_query(F.data.startswith("max_gifts:"))
+async def change_max_gifts(callback: CallbackQuery):
+    action = callback.data.split(":", 1)[1]
+    current = safe_int(bot_settings.get("max_owner_gifts", 5), 5)
+    if action == "inc":
+        current = min(50, current + 1)
+    elif action == "dec":
+        current = max(0, current - 1)
+    bot_settings["max_owner_gifts"] = current
+    save_settings(bot_settings)
+    OWNER_GIFTS_COUNT_CACHE.clear()
+    PROFILE_FILTER_CACHE.clear()
+    await filters_panel(callback)
+
+
+@dp.callback_query(F.data == "noop")
+async def noop(callback: CallbackQuery):
+    await callback.answer()
+
+
 # ==========================
 # МОНИТОРИНГ
 # ==========================
@@ -805,7 +988,7 @@ async def monitor_worker():
                     base.resell_min_stars or 0,
                     base.resell_min_stars + 5000 if base.resell_min_stars else 10000,
                     need=5,
-                    skip_slugs=SENT_MONITOR_SLUGS,
+                    skip_slugs=SENT_MONITOR_SLUGS if bot_settings.get("monitor_new_only", True) else set(),
                 )
                 for g in results:
                     if g.slug not in SENT_MONITOR_SLUGS:
@@ -1063,7 +1246,7 @@ async def cancel_cmd(message: Message, state: FSMContext):
 # ==========================
 
 async def main():
-    global OWNERS_BLACKLIST, SEEN_GIFTS_BY_QUERY, SENT_MONITOR_SLUGS, bot_settings, LINKS_PER_MESSAGE, DELAY_BETWEEN_BATCHES
+    global OWNERS_BLACKLIST, SEEN_GIFTS_BY_QUERY, SENT_MONITOR_SLUGS, bot_settings, LINKS_PER_MESSAGE, DELAY_BETWEEN_BATCHES, monitor_running, monitor_task
 
     OWNERS_BLACKLIST = load_owners_blacklist()
     SEEN_GIFTS_BY_QUERY = load_seen_gifts()
