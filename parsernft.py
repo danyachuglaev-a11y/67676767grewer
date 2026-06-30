@@ -5,8 +5,6 @@ import json
 import logging
 import random
 import re
-import sqlite3
-import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -57,7 +55,6 @@ OWNERS_BLACKLIST_FILE = "owners_blacklist.json"
 SEEN_GIFTS_FILE = "seen_gifts.json"
 SENT_MONITOR_SLUGS_FILE = "sent_monitor_slugs.json"
 SETTINGS_FILE = "bot_settings.json"
-DB_FILE = "gift_parser.db"
 
 # ==========================
 
@@ -92,25 +89,25 @@ monitor_task = None
 bot_settings = {
     "links_per_message": 10,
     "delay_between_batches": 30,
-    "skip_arabic_profiles": True,
-    "max_owner_gifts": 5,
-    "girls_only": False,
-    "monitor_new_only": True,
 }
 LINKS_PER_MESSAGE = bot_settings["links_per_message"]
 DELAY_BETWEEN_BATCHES = bot_settings["delay_between_batches"]
 last_send_time_by_model: Dict[str, float] = {}
 
 PAID_MESSAGES_CACHE: Dict[int, bool] = {}
-OWNER_GIFTS_COUNT_CACHE: Dict[int, int] = {}
-PROFILE_FILTER_CACHE: Dict[int, bool] = {}
 
+# Фильтр арабских символов: пропускаем владельцев, у которых
+# в имени, username или label есть символы арабского письма.
 ARABIC_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]")
-GIRL_NAME_RE = re.compile(
-    r"\b(девочка|девушка|она|girl|female|woman|lady|princess|queen|baby|miss|her)\b",
-    re.IGNORECASE,
-)
 
+
+def has_arabic_symbols(*values: Any) -> bool:
+    for value in values:
+        if value is None:
+            continue
+        if ARABIC_RE.search(str(value)):
+            return True
+    return False
 
 
 @dataclass
@@ -173,26 +170,14 @@ def save_settings(settings: dict):
 
 def load_owners_blacklist() -> Dict[str, str]:
     try:
-        data = db_load_owners_blacklist()
-        if data:
-            return data
-    except Exception as e:
-        log.debug(f"DB blacklist load failed: {e}")
-    try:
         with open(OWNERS_BLACKLIST_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            data = {str(k): str(v) for k, v in data.items()}
-            db_save_owners_blacklist(data)
-            return data
+            return {str(k): str(v) for k, v in data.items()}
     except:
         return {}
 
 
 def save_owners_blacklist():
-    try:
-        db_save_owners_blacklist(OWNERS_BLACKLIST)
-    except Exception as e:
-        log.debug(f"DB blacklist save failed: {e}")
     try:
         with open(OWNERS_BLACKLIST_FILE, "w", encoding="utf-8") as f:
             json.dump(OWNERS_BLACKLIST, f, ensure_ascii=False, indent=2)
@@ -202,28 +187,14 @@ def save_owners_blacklist():
 
 def load_seen_gifts() -> Dict[str, List[str]]:
     try:
-        data = db_load_seen_gifts()
-        if data:
-            return data
-    except Exception as e:
-        log.debug(f"DB seen load failed: {e}")
-    try:
         with open(SEEN_GIFTS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            data = {str(k): [str(x) for x in v] for k, v in data.items() if isinstance(v, list)}
-            for q, slugs in data.items():
-                db_save_seen_query(q, slugs)
-            return data
+            return {str(k): [str(x) for x in v] for k, v in data.items() if isinstance(v, list)}
     except:
         return {}
 
 
 def save_seen_gifts():
-    try:
-        for q, slugs in SEEN_GIFTS_BY_QUERY.items():
-            db_save_seen_query(q, slugs)
-    except Exception as e:
-        log.debug(f"DB seen save failed: {e}")
     try:
         with open(SEEN_GIFTS_FILE, "w", encoding="utf-8") as f:
             json.dump(SEEN_GIFTS_BY_QUERY, f, ensure_ascii=False, indent=2)
@@ -233,96 +204,19 @@ def save_seen_gifts():
 
 def load_sent_monitor_slugs() -> set:
     try:
-        data = db_load_monitor_slugs()
-        if data:
-            return data
-    except Exception as e:
-        log.debug(f"DB monitor load failed: {e}")
-    try:
         with open(SENT_MONITOR_SLUGS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            data = set(data) if isinstance(data, list) else set()
-            db_save_monitor_slugs(data)
-            return data
+            return set(data) if isinstance(data, list) else set()
     except:
         return set()
 
 
 def save_sent_monitor_slugs(slugs: set):
     try:
-        db_save_monitor_slugs(slugs)
-    except Exception as e:
-        log.debug(f"DB monitor save failed: {e}")
-    try:
         with open(SENT_MONITOR_SLUGS_FILE, "w", encoding="utf-8") as f:
             json.dump(list(slugs), f, ensure_ascii=False, indent=2)
     except:
         pass
-
-
-def init_db():
-    """SQLite-хранилище: устойчивее JSON и не теряет историю при рестартах."""
-    with sqlite3.connect(DB_FILE) as con:
-        con.execute("CREATE TABLE IF NOT EXISTS owners_blacklist (key TEXT PRIMARY KEY, label TEXT NOT NULL)")
-        con.execute("CREATE TABLE IF NOT EXISTS seen_gifts (query_key TEXT NOT NULL, slug TEXT NOT NULL, seen_at INTEGER NOT NULL, PRIMARY KEY(query_key, slug))")
-        con.execute("CREATE TABLE IF NOT EXISTS monitor_slugs (slug TEXT PRIMARY KEY, seen_at INTEGER NOT NULL)")
-        con.execute("CREATE INDEX IF NOT EXISTS idx_seen_query ON seen_gifts(query_key)")
-        con.commit()
-
-
-def db_load_owners_blacklist() -> Dict[str, str]:
-    init_db()
-    with sqlite3.connect(DB_FILE) as con:
-        return {str(k): str(v) for k, v in con.execute("SELECT key, label FROM owners_blacklist")}
-
-
-def db_save_owners_blacklist(data: Dict[str, str]):
-    init_db()
-    with sqlite3.connect(DB_FILE) as con:
-        con.execute("DELETE FROM owners_blacklist")
-        con.executemany("INSERT OR REPLACE INTO owners_blacklist(key, label) VALUES(?, ?)", data.items())
-        con.commit()
-
-
-def db_load_seen_gifts() -> Dict[str, List[str]]:
-    init_db()
-    result: Dict[str, List[str]] = {}
-    with sqlite3.connect(DB_FILE) as con:
-        for query_key, slug in con.execute("SELECT query_key, slug FROM seen_gifts ORDER BY seen_at ASC"):
-            result.setdefault(str(query_key), []).append(str(slug))
-    return result
-
-
-def db_save_seen_query(query_key: str, slugs: List[str]):
-    init_db()
-    now = int(time.time())
-    with sqlite3.connect(DB_FILE) as con:
-        con.executemany(
-            "INSERT OR IGNORE INTO seen_gifts(query_key, slug, seen_at) VALUES(?, ?, ?)",
-            [(query_key, slug, now) for slug in slugs],
-        )
-        con.commit()
-
-
-def db_clear_seen_query(query_key: str):
-    init_db()
-    with sqlite3.connect(DB_FILE) as con:
-        con.execute("DELETE FROM seen_gifts WHERE query_key = ?", (query_key,))
-        con.commit()
-
-
-def db_load_monitor_slugs() -> set:
-    init_db()
-    with sqlite3.connect(DB_FILE) as con:
-        return {str(row[0]) for row in con.execute("SELECT slug FROM monitor_slugs")}
-
-
-def db_save_monitor_slugs(slugs: set):
-    init_db()
-    now = int(time.time())
-    with sqlite3.connect(DB_FILE) as con:
-        con.executemany("INSERT OR IGNORE INTO monitor_slugs(slug, seen_at) VALUES(?, ?)", [(slug, now) for slug in slugs])
-        con.commit()
 
 
 # ==========================
@@ -375,20 +269,6 @@ class AuthState(StatesGroup):
     waiting_password = State()
 
 
-async def recreate_user_client():
-    """Пересоздаёт Telethon-клиент без рестарта бота/хостинга."""
-    global user_client, BASE_GIFTS, BASE_GIFTS_BY_ID
-    try:
-        if user_client.is_connected():
-            await user_client.disconnect()
-    except Exception:
-        pass
-    user_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
-    BASE_GIFTS = []
-    BASE_GIFTS_BY_ID = {}
-    await user_client.connect()
-
-
 async def ensure_user_client_connected():
     if not user_client.is_connected():
         await user_client.connect()
@@ -399,24 +279,6 @@ async def is_user_client_authorized() -> bool:
     return await user_client.is_user_authorized()
 
 
-@dp.message(Command("relogin"))
-async def relogin_command(message: Message, state: FSMContext):
-    """Принудительно добавить/обновить сессию без перезапуска бота."""
-    if not is_admin_user(message.from_user.id):
-        await message.answer("⛔ Только для администратора")
-        return
-    await state.clear()
-    await recreate_user_client()
-    await state.set_state(AuthState.waiting_phone)
-    await message.answer(
-        "🔁 *ПЕРЕПОДКЛЮЧЕНИЕ СЕССИИ*\n\n"
-        "Бот не перезапускается. Введите номер телефона в международном формате:\n"
-        "Пример: `+79991234567`\n\n"
-        "❌ Отмена — /cancel",
-        parse_mode="Markdown"
-    )
-
-
 @dp.message(Command("add_session"))
 async def add_session_command(message: Message, state: FSMContext):
     """Только админ может добавить сессию"""
@@ -425,7 +287,7 @@ async def add_session_command(message: Message, state: FSMContext):
         return
     
     if await is_user_client_authorized():
-        await message.answer("✅ Сессия уже добавлена. Если хочешь заменить её без рестарта, используй /relogin")
+        await message.answer("✅ Сессия уже добавлена. Бот работает.")
         return
     
     await state.set_state(AuthState.waiting_phone)
@@ -514,7 +376,6 @@ async def finish_auth_success(message: Message):
     )
     
     await load_base_gifts()
-    await start_monitor_if_needed()
     
     await message.answer(
         f"✅ *Готово!*\n\n"
@@ -530,49 +391,31 @@ async def finish_auth_success(message: Message):
 # ==========================
 
 async def load_base_gifts() -> List[BaseGift]:
-    """
-    Загружает базовые модели подарков.
-
-    Важно: нельзя отбрасывать модель только потому, что availability_resale пустой/0/None.
-    У части подарков Telegram может не вернуть это поле, из-за чего старый код грузил 0 моделей.
-    """
     global BASE_GIFTS, BASE_GIFTS_BY_ID
     log.info("Loading base star gifts...")
-
     result = await user_client(functions.payments.GetStarGiftsRequest(hash=0))
     raw_gifts = getattr(result, "gifts", []) or []
-    log.info("Raw gifts received: %s", len(raw_gifts))
-
-    gifts: List[BaseGift] = []
-    skipped = 0
-
+    gifts = []
     for raw in raw_gifts:
         gift_id = safe_int(get_field(raw, "id"))
         title = get_field(raw, "title")
-
         if not gift_id or not title:
-            skipped += 1
             continue
-
-        availability_resale = safe_int(get_field(raw, "availability_resale"), 0)
-        resell_min_stars = safe_int(get_field(raw, "resell_min_stars"), 0)
-        stars = safe_int(get_field(raw, "stars"), 0)
-
+        availability_resale = get_field(raw, "availability_resale")
+        if not availability_resale:
+            continue
         gifts.append(BaseGift(
             gift_id=gift_id,
             title=str(title),
-            stars=stars,
-            availability_resale=availability_resale,
-            resell_min_stars=resell_min_stars,
+            stars=get_field(raw, "stars"),
+            availability_resale=safe_int(availability_resale),
+            resell_min_stars=safe_int(get_field(raw, "resell_min_stars")),
             sold_out=get_field(raw, "sold_out"),
         ))
-
     gifts.sort(key=lambda g: (g.resell_min_stars or 999999, g.title.lower()))
-
     BASE_GIFTS = gifts
     BASE_GIFTS_BY_ID = {g.gift_id: g for g in gifts}
-
-    log.info("Loaded %s base gifts, skipped %s", len(gifts), skipped)
+    log.info("Loaded %s base gifts", len(gifts))
     return gifts
 
 
@@ -632,20 +475,15 @@ def get_seen_slugs(gift_id: int, min_stars: int, max_stars: int) -> set:
 def remember_seen_results(gift_id: int, min_stars: int, max_stars: int, results: List[MarketGift]):
     key = f"{gift_id}:{min_stars}:{max_stars}"
     old = set(SEEN_GIFTS_BY_QUERY.get(key, []))
-    fresh = []
     for gift in results:
         if gift.slug not in old:
             SEEN_GIFTS_BY_QUERY.setdefault(key, []).append(gift.slug)
-            fresh.append(gift.slug)
-    if fresh:
-        db_save_seen_query(key, fresh)
-        save_seen_gifts()
+    save_seen_gifts()
 
 
 def clear_seen_for_query(gift_id: int, min_stars: int, max_stars: int):
     key = f"{gift_id}:{min_stars}:{max_stars}"
     SEEN_GIFTS_BY_QUERY.pop(key, None)
-    db_clear_seen_query(key)
     save_seen_gifts()
 
 
@@ -719,116 +557,6 @@ async def has_paid_messages_enabled(user_id: int) -> bool:
         return False
 
 
-
-def text_has_arabic(text: Optional[str]) -> bool:
-    return bool(text and ARABIC_RE.search(str(text)))
-
-
-def looks_like_girl_profile(entity: Any, full_user: Any = None) -> bool:
-    """Telegram не отдаёт пол пользователя, поэтому это только эвристика по имени/био."""
-    parts = [
-        getattr(entity, "first_name", "") or "",
-        getattr(entity, "last_name", "") or "",
-        getattr(entity, "username", "") or "",
-    ]
-    about = getattr(getattr(full_user, "full_user", None), "about", "") if full_user else ""
-    if about:
-        parts.append(about)
-    text = " ".join(parts).lower()
-    if GIRL_NAME_RE.search(text):
-        return True
-    first_name = (getattr(entity, "first_name", "") or "").strip().lower()
-    # Очень мягкая эвристика для рус/укр/англ имён: часто женские имена заканчиваются на -а/-я/-ia/-na.
-    return bool(first_name and (first_name.endswith(("а", "я", "ia", "na", "ie", "elle"))))
-
-
-async def get_owner_profile_gifts_count(user_id: int, max_allowed: int) -> int:
-    """Возвращает количество подарков в профиле, считая только до max_allowed + 1."""
-    if user_id in OWNER_GIFTS_COUNT_CACHE:
-        return OWNER_GIFTS_COUNT_CACHE[user_id]
-    try:
-        peer = await user_client.get_input_entity(user_id)
-        req_cls = getattr(functions.payments, "GetSavedStarGiftsRequest", None)
-        if not req_cls:
-            # На старой версии Telethon метода может не быть — не режем владельца вслепую.
-            OWNER_GIFTS_COUNT_CACHE[user_id] = 0
-            return 0
-        kwargs = dict(peer=peer, offset="", limit=max_allowed + 1)
-        sig = inspect.signature(req_cls)
-        for optional_flag in ("exclude_unsaved", "exclude_saved", "exclude_unlimited", "exclude_limited", "exclude_unique", "sort_by_value"):
-            if optional_flag in sig.parameters:
-                kwargs[optional_flag] = False
-        result = await user_client(req_cls(**kwargs))
-        gifts = getattr(result, "gifts", []) or []
-        count = len(gifts)
-        OWNER_GIFTS_COUNT_CACHE[user_id] = count
-        return count
-    except Exception as e:
-        log.debug(f"Owner gifts count check failed for {user_id}: {e}")
-        OWNER_GIFTS_COUNT_CACHE[user_id] = 0
-        return 0
-
-
-async def owner_passes_profile_filters(owner_id: Optional[int], owner: OwnerInfo) -> bool:
-    if not owner_id:
-        return True
-    if owner_id in PROFILE_FILTER_CACHE:
-        return PROFILE_FILTER_CACHE[owner_id]
-
-    skip_arabic = bool(bot_settings.get("skip_arabic_profiles", True))
-    max_owner_gifts = safe_int(bot_settings.get("max_owner_gifts", 5), 5)
-    girls_only = bool(bot_settings.get("girls_only", False))
-
-    try:
-        entity = await user_client.get_entity(owner_id)
-        full_user = None
-        try:
-            full_user = await user_client(functions.users.GetFullUserRequest(id=owner_id))
-        except Exception:
-            full_user = None
-
-        profile_text = " ".join(filter(None, [
-            getattr(entity, "first_name", "") or "",
-            getattr(entity, "last_name", "") or "",
-            getattr(entity, "username", "") or "",
-            owner.label or "",
-            getattr(getattr(full_user, "full_user", None), "about", "") if full_user else "",
-        ]))
-
-        if skip_arabic and text_has_arabic(profile_text):
-            PROFILE_FILTER_CACHE[owner_id] = False
-            return False
-
-        if max_owner_gifts >= 0:
-            gifts_count = await get_owner_profile_gifts_count(owner_id, max_owner_gifts)
-            if gifts_count > max_owner_gifts:
-                PROFILE_FILTER_CACHE[owner_id] = False
-                return False
-
-        if girls_only and not looks_like_girl_profile(entity, full_user):
-            PROFILE_FILTER_CACHE[owner_id] = False
-            return False
-
-        PROFILE_FILTER_CACHE[owner_id] = True
-        return True
-    except Exception as e:
-        log.debug(f"Profile filter failed for {owner_id}: {e}")
-        PROFILE_FILTER_CACHE[owner_id] = True
-        return True
-
-
-async def throttle_model_request(model_key: str):
-    delay = safe_int(bot_settings.get("delay_between_batches", DELAY_BETWEEN_BATCHES), DELAY_BETWEEN_BATCHES)
-    if delay <= 0:
-        return
-    now = time.time()
-    last = last_send_time_by_model.get(model_key, 0)
-    wait_for = delay - (now - last)
-    if wait_for > 0:
-        await asyncio.sleep(wait_for)
-    last_send_time_by_model[model_key] = time.time()
-
-
 async def find_market_gifts(
     gift_id: int,
     min_stars: int,
@@ -841,10 +569,8 @@ async def find_market_gifts(
     offset = ""
     pages = 0
 
-    model_key = str(gift_id)
     while len(found) < need and pages < MAX_MARKET_PAGES:
         pages += 1
-        await throttle_model_request(model_key)
         try:
             result = await user_client(
                 functions.payments.GetResaleStarGiftsRequest(
@@ -880,15 +606,16 @@ async def find_market_gifts(
             owner = await resolve_owner_info(raw)
             if is_owner_blacklisted(owner.key):
                 continue
+
+            # Пропускаем владельцев с арабскими символами в профиле/username.
+            if has_arabic_symbols(owner.username, owner.label, owner.key):
+                log.debug(f"Skipping {slug} - owner has Arabic symbols: {owner.display}")
+                continue
             
             owner_id_raw = get_field(raw, "owner_id")
             owner_id = extract_user_id(owner_id_raw)
             if owner_id and await has_paid_messages_enabled(owner_id):
                 log.debug(f"Skipping {slug} - owner requires stars to message")
-                continue
-
-            if not await owner_passes_profile_filters(owner_id, owner):
-                log.debug(f"Skipping {slug} - owner did not pass profile filters")
                 continue
             
             found.append(
@@ -953,12 +680,11 @@ async def send_search_results(
 
 def main_menu_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text="🎁 Искать подарки", callback_data="models:0")],
-        [InlineKeyboardButton(text="⚙️ Фильтры", callback_data="filters_panel")],
-        [InlineKeyboardButton(text="🚫 Чёрный список", callback_data="owners_blacklist")],
+        [InlineKeyboardButton(text="📦 ВЫБРАТЬ МОДЕЛЬ", callback_data="models:0")],
+        [InlineKeyboardButton(text="🚫 ЧЁРНЫЙ СПИСОК", callback_data="owners_blacklist")],
     ]
     if MONITOR_CHAT_ID and is_admin_user(user_id):
-        rows.insert(2, [InlineKeyboardButton(text="📡 Новые листинги", callback_data="monitor_admin_panel")])
+        rows.insert(1, [InlineKeyboardButton(text="📡 МОНИТОРИНГ", callback_data="monitor_admin_panel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1006,27 +732,6 @@ def blacklist_keyboard() -> InlineKeyboardMarkup:
     if rows:
         rows.append([InlineKeyboardButton(text="🧹 ОЧИСТИТЬ ВСЁ", callback_data="clear_owners_blacklist")])
     rows.append([InlineKeyboardButton(text="🏠 ГЛАВНОЕ", callback_data="menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-
-def bool_badge(value: bool) -> str:
-    return "✅" if value else "❌"
-
-
-def filters_keyboard() -> InlineKeyboardMarkup:
-    max_gifts = bot_settings.get("max_owner_gifts", 5)
-    rows = [
-        [InlineKeyboardButton(text=f"{bool_badge(bot_settings.get('skip_arabic_profiles', True))} Пропускать арабские символы", callback_data="toggle_filter:skip_arabic_profiles")],
-        [InlineKeyboardButton(text=f"🎁 Подарков в профиле: до {max_gifts}", callback_data="noop")],
-        [
-            InlineKeyboardButton(text="➖", callback_data="max_gifts:dec"),
-            InlineKeyboardButton(text="➕", callback_data="max_gifts:inc"),
-        ],
-        [InlineKeyboardButton(text=f"{bool_badge(bot_settings.get('girls_only', False))} Искать только девочек", callback_data="toggle_filter:girls_only")],
-        [InlineKeyboardButton(text=f"{bool_badge(bot_settings.get('monitor_new_only', True))} Мониторить только новые", callback_data="toggle_filter:monitor_new_only")],
-        [InlineKeyboardButton(text="🏠 Главное", callback_data="menu")],
-    ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1099,62 +804,9 @@ async def clear_blacklist(callback: CallbackQuery):
     await show_blacklist(callback)
 
 
-
-@dp.callback_query(F.data == "filters_panel")
-async def filters_panel(callback: CallbackQuery):
-    text = (
-        "⚙️ *ФИЛЬТРЫ ПОИСКА*\n\n"
-        "• арабские символы — пропускает владельцев, если в имени/юзернейме/био есть арабская письменность;\n"
-        "• подарков в профиле — пропускает владельцев, у которых больше лимита;\n"
-        "• только девочки — примерная эвристика по имени/био, Telegram не отдаёт пол напрямую;\n"
-        "• только новые — мониторинг отправляет только ещё не отправленные листинги."
-    )
-    await callback.message.edit_text(text, reply_markup=filters_keyboard(), parse_mode="Markdown")
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("toggle_filter:"))
-async def toggle_filter(callback: CallbackQuery):
-    key = callback.data.split(":", 1)[1]
-    if key not in {"skip_arabic_profiles", "girls_only", "monitor_new_only"}:
-        await callback.answer("Неизвестный фильтр")
-        return
-    bot_settings[key] = not bool(bot_settings.get(key, False))
-    save_settings(bot_settings)
-    PROFILE_FILTER_CACHE.clear()
-    await filters_panel(callback)
-
-
-@dp.callback_query(F.data.startswith("max_gifts:"))
-async def change_max_gifts(callback: CallbackQuery):
-    action = callback.data.split(":", 1)[1]
-    current = safe_int(bot_settings.get("max_owner_gifts", 5), 5)
-    if action == "inc":
-        current = min(50, current + 1)
-    elif action == "dec":
-        current = max(0, current - 1)
-    bot_settings["max_owner_gifts"] = current
-    save_settings(bot_settings)
-    OWNER_GIFTS_COUNT_CACHE.clear()
-    PROFILE_FILTER_CACHE.clear()
-    await filters_panel(callback)
-
-
-@dp.callback_query(F.data == "noop")
-async def noop(callback: CallbackQuery):
-    await callback.answer()
-
-
 # ==========================
 # МОНИТОРИНГ
 # ==========================
-
-async def start_monitor_if_needed():
-    global monitor_running, monitor_task
-    if MONITOR_CHAT_ID and not monitor_running and await is_user_client_authorized():
-        monitor_running = True
-        monitor_task = asyncio.create_task(monitor_worker())
-
 
 async def monitor_worker():
     global monitor_running, SENT_MONITOR_SLUGS
@@ -1171,7 +823,7 @@ async def monitor_worker():
                     base.resell_min_stars or 0,
                     base.resell_min_stars + 5000 if base.resell_min_stars else 10000,
                     need=5,
-                    skip_slugs=SENT_MONITOR_SLUGS if bot_settings.get("monitor_new_only", True) else set(),
+                    skip_slugs=SENT_MONITOR_SLUGS,
                 )
                 for g in results:
                     if g.slug not in SENT_MONITOR_SLUGS:
@@ -1429,7 +1081,7 @@ async def cancel_cmd(message: Message, state: FSMContext):
 # ==========================
 
 async def main():
-    global OWNERS_BLACKLIST, SEEN_GIFTS_BY_QUERY, SENT_MONITOR_SLUGS, bot_settings, LINKS_PER_MESSAGE, DELAY_BETWEEN_BATCHES, monitor_running, monitor_task
+    global OWNERS_BLACKLIST, SEEN_GIFTS_BY_QUERY, SENT_MONITOR_SLUGS, bot_settings, LINKS_PER_MESSAGE, DELAY_BETWEEN_BATCHES
 
     OWNERS_BLACKLIST = load_owners_blacklist()
     SEEN_GIFTS_BY_QUERY = load_seen_gifts()
@@ -1450,7 +1102,9 @@ async def main():
             log.info(f"Models loaded: {len(BASE_GIFTS)}")
         except Exception as e:
             log.error(f"Models load error: {e}")
-        await start_monitor_if_needed()
+        if MONITOR_CHAT_ID:
+            monitor_running = True
+            monitor_task = asyncio.create_task(monitor_worker())
     else:
         log.info("Telethon not authorized. Admin must run /add_session")
 
