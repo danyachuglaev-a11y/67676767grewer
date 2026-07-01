@@ -290,7 +290,7 @@ async def check_sub(callback: CallbackQuery):
         await callback.answer("❌ Подписка не найдена", show_alert=True)
 
 # ==========================
-# АВТОРИЗАЦИЯ (СТАРЫЙ СТИЛЬ)
+# АВТОРИЗАЦИЯ
 # ==========================
 
 @dp.message(Command("add_session"))
@@ -367,7 +367,7 @@ async def finish_auth_success(message: Message):
     await message.answer(f"✅ Готово!\n📦 Моделей: {len(BASE_GIFTS)}\n\nНажми /start")
 
 # ==========================
-# ЗАГРУЗКА МОДЕЛЕЙ
+# ЗАГРУЗКА МОДЕЛЕЙ (ИСПРАВЛЕНА)
 # ==========================
 
 async def load_base_gifts() -> List[BaseGift]:
@@ -381,23 +381,33 @@ async def load_base_gifts() -> List[BaseGift]:
         
         result = await user_client(functions.payments.GetStarGiftsRequest(hash=0))
         raw_gifts = getattr(result, "gifts", []) or []
+        
+        log.info(f"Raw gifts count: {len(raw_gifts)}")
+        
         gifts = []
         for raw in raw_gifts:
             gift_id = safe_int(get_field(raw, "id"))
             title = get_field(raw, "title")
-            if not gift_id or not title:
+            
+            if not gift_id:
                 continue
+            
+            if not title:
+                title = f"Gift {gift_id}"
+            
             availability_resale = get_field(raw, "availability_resale")
-            if not availability_resale:
-                continue
+            if availability_resale is None:
+                availability_resale = 0
+            
             gifts.append(BaseGift(
                 gift_id=gift_id,
                 title=str(title),
                 stars=get_field(raw, "stars"),
-                availability_resale=safe_int(availability_resale),
-                resell_min_stars=safe_int(get_field(raw, "resell_min_stars")),
+                availability_resale=safe_int(availability_resale, 0),
+                resell_min_stars=safe_int(get_field(raw, "resell_min_stars"), 0),
                 sold_out=get_field(raw, "sold_out"),
             ))
+        
         gifts.sort(key=lambda g: (g.resell_min_stars or 999999, g.title.lower()))
         BASE_GIFTS = gifts
         BASE_GIFTS_BY_ID = {g.gift_id: g for g in gifts}
@@ -405,6 +415,8 @@ async def load_base_gifts() -> List[BaseGift]:
         return gifts
     except Exception as e:
         log.error(f"Error loading gifts: {e}")
+        import traceback
+        traceback.print_exc()
         return []
 
 async def ensure_models_loaded():
