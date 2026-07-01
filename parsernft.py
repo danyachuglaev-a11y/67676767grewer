@@ -605,19 +605,41 @@ async def get_resale_page(
     limit: int = REQUEST_PAGE_LIMIT,
     sort_by_price: bool = True,
 ):
+    """
+    Совместимый запрос resale-подарков.
+
+    На разных версиях Telethon конструктор GetResaleStarGiftsRequest
+    может отличаться: где-то есть stars_only/for_craft, а где-то их нет.
+    Поэтому сначала пробуем новый вариант, а если хост ругается TypeError —
+    автоматически используем старый вариант без этих аргументов.
+    """
     while True:
         try:
-            return await user_client(
-                functions.payments.GetResaleStarGiftsRequest(
-                    gift_id=gift_id,
-                    offset=offset,
-                    limit=limit,
-                    sort_by_price=sort_by_price,
-                    sort_by_num=False,
-                    stars_only=True,
-                    for_craft=False,
+            try:
+                return await user_client(
+                    functions.payments.GetResaleStarGiftsRequest(
+                        gift_id=gift_id,
+                        offset=offset,
+                        limit=limit,
+                        sort_by_price=sort_by_price,
+                        sort_by_num=False,
+                        stars_only=True,
+                        for_craft=False,
+                    )
                 )
-            )
+            except TypeError as e:
+                if "stars_only" in str(e) or "for_craft" in str(e):
+                    log.warning("Telethon has old GetResaleStarGiftsRequest signature, retrying without stars_only/for_craft")
+                    return await user_client(
+                        functions.payments.GetResaleStarGiftsRequest(
+                            gift_id=gift_id,
+                            offset=offset,
+                            limit=limit,
+                            sort_by_price=sort_by_price,
+                            sort_by_num=False,
+                        )
+                    )
+                raise
         except FloodWaitError as e:
             wait_time = int(e.seconds) + 1
             log.warning("FloodWait on resale request: %s sec", wait_time)
