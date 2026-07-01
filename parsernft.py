@@ -382,29 +382,37 @@ async def load_base_gifts() -> List[BaseGift]:
     log.info("Loading base star gifts...")
     result = await user_client(functions.payments.GetStarGiftsRequest(hash=0))
     raw_gifts = getattr(result, "gifts", []) or []
+
     gifts = []
+    skipped = 0
+
     for raw in raw_gifts:
         gift_id = safe_int(get_field(raw, "id"))
-        title = get_field(raw, "title")
-        if not gift_id or not title:
+        if not gift_id:
+            skipped += 1
             continue
-        availability_resale = get_field(raw, "availability_resale")
-        if not availability_resale:
-            continue
+
+        title = (
+            get_field(raw, "title")
+            or get_field(raw, "name")
+            or get_field(get_field(raw, "sticker"), "emoji")
+            or f"Gift {gift_id}"
+        )
+
         gifts.append(BaseGift(
             gift_id=gift_id,
             title=str(title),
             stars=get_field(raw, "stars"),
-            availability_resale=safe_int(availability_resale),
-            resell_min_stars=safe_int(get_field(raw, "resell_min_stars")),
+            availability_resale=safe_int(get_field(raw, "availability_resale"), 0),
+            resell_min_stars=safe_int(get_field(raw, "resell_min_stars"), 0),
             sold_out=get_field(raw, "sold_out"),
         ))
+
     gifts.sort(key=lambda g: (g.resell_min_stars or 999999, g.title.lower()))
     BASE_GIFTS = gifts
     BASE_GIFTS_BY_ID = {g.gift_id: g for g in gifts}
-    log.info("Loaded %s base gifts", len(gifts))
+    log.info("Loaded %s base gifts, skipped %s", len(gifts), skipped)
     return gifts
-
 
 async def ensure_models_loaded():
     if not BASE_GIFTS:
