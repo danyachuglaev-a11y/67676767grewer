@@ -1,7 +1,5 @@
 aiogram==3.13.1
-telethon==1.38.1
+Telethon==1.38.1
+aiohttp==3.10.5
 cryptg
 tgcrypto
-aiofiles
-aiosqlite
-python-dotenv
