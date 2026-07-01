@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import os
 import random
 import time
 from dataclasses import dataclass
@@ -41,8 +40,6 @@ MONITOR_CHAT_ID = -1004358773774
 MONITOR_INTERVAL = 60
 
 SESSION_NAME = "telethon_market_userbot"
-SESSIONS_FILE = "sessions.json"
-ACTIVE_SESSION_FILE = "active_session.json"
 GIFTS_PER_PAGE = 8
 SEARCH_RESULT_LIMIT = 10
 REQUEST_PAGE_LIMIT = 50
@@ -62,8 +59,8 @@ log = logging.getLogger("nft-gift-bot")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+user_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
-# Глобальные переменные
 BASE_GIFTS: List["BaseGift"] = []
 BASE_GIFTS_BY_ID: Dict[int, "BaseGift"] = {}
 USER_SELECTED_GIFT: Dict[int, int] = {}
@@ -78,10 +75,6 @@ OWNER_CACHE: Dict[int, "OwnerInfo"] = {}
 
 monitor_running = False
 monitor_task = None
-
-user_client: Optional[TelegramClient] = None
-active_session_name: Optional[str] = None
-sessions: Dict[str, Dict[str, Any]] = {}
 
 @dataclass
 class BaseGift:
@@ -121,144 +114,6 @@ class AuthState(StatesGroup):
     waiting_phone = State()
     waiting_code = State()
     waiting_password = State()
-    waiting_session_name = State()
-
-# ==========================
-# УПРАВЛЕНИЕ СЕССИЯМИ
-# ==========================
-
-def load_sessions() -> Dict[str, Dict[str, Any]]:
-    try:
-        with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return {}
-
-def save_sessions():
-    try:
-        with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
-            json.dump(sessions, f, ensure_ascii=False, indent=2)
-    except:
-        pass
-
-def load_active_session() -> Optional[str]:
-    try:
-        with open(ACTIVE_SESSION_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data.get("active_session")
-    except:
-        return None
-
-def save_active_session(name: Optional[str]):
-    try:
-        with open(ACTIVE_SESSION_FILE, "w", encoding="utf-8") as f:
-            json.dump({"active_session": name}, f, ensure_ascii=False, indent=2)
-    except:
-        pass
-
-def get_session_file(session_name: str) -> str:
-    return f"{session_name}.session"
-
-async def create_telethon_client(session_name: str) -> TelegramClient:
-    session_file = get_session_file(session_name)
-    return TelegramClient(session_file, API_ID, API_HASH)
-
-async def switch_session(session_name: str) -> bool:
-    global user_client, active_session_name
-    
-    if session_name not in sessions:
-        log.error(f"Session {session_name} not found")
-        return False
-    
-    if user_client and user_client.is_connected():
-        await user_client.disconnect()
-    
-    user_client = await create_telethon_client(session_name)
-    await user_client.connect()
-    
-    if await user_client.is_user_authorized():
-        active_session_name = session_name
-        save_active_session(session_name)
-        
-        for name in sessions:
-            sessions[name]["active"] = (name == session_name)
-        save_sessions()
-        
-        log.info(f"Switched to session: {session_name}")
-        return True
-    else:
-        log.warning(f"Session {session_name} is not authorized")
-        return False
-
-async def init_session_manager():
-    global user_client, active_session_name, sessions
-    
-    sessions = load_sessions()
-    active_session_name = load_active_session()
-    
-    if active_session_name and active_session_name in sessions:
-        user_client = await create_telethon_client(active_session_name)
-        await user_client.connect()
-        if await user_client.is_user_authorized():
-            log.info(f"Session {active_session_name} loaded")
-            sessions[active_session_name]["active"] = True
-            save_sessions()
-            return True
-        else:
-            log.warning(f"Session {active_session_name} is not authorized")
-            active_session_name = None
-            save_active_session(None)
-    
-    for name in sessions:
-        if sessions[name].get("authorized", False):
-            client = await create_telethon_client(name)
-            await client.connect()
-            if await client.is_user_authorized():
-                user_client = client
-                active_session_name = name
-                save_active_session(name)
-                sessions[name]["active"] = True
-                save_sessions()
-                log.info(f"Session {name} loaded")
-                return True
-            await client.disconnect()
-    
-    user_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
-    await user_client.connect()
-    log.info("Using default session")
-    return False
-
-async def add_new_session(session_name: str, phone: str) -> bool:
-    if session_name in sessions:
-        return False
-    
-    sessions[session_name] = {
-        "phone": phone,
-        "created": datetime.now().isoformat(),
-        "authorized": False,
-        "active": False
-    }
-    save_sessions()
-    return True
-
-async def delete_session(session_name: str) -> bool:
-    if session_name not in sessions:
-        return False
-    
-    session_file = get_session_file(session_name)
-    if os.path.exists(session_file):
-        try:
-            os.remove(session_file)
-        except:
-            pass
-    
-    del sessions[session_name]
-    save_sessions()
-    
-    if active_session_name == session_name:
-        save_active_session(None)
-    
-    return True
 
 # ==========================
 # ЗАГРУЗКА/СОХРАНЕНИЕ
@@ -394,17 +249,12 @@ def extract_user_id(raw_id: Any) -> Optional[int]:
         return None
 
 async def ensure_user_client_connected():
-    if not user_client or not user_client.is_connected():
-        if user_client:
-            await user_client.connect()
-        else:
-            await init_session_manager()
+    if not user_client.is_connected():
+        await user_client.connect()
 
 async def is_user_client_authorized() -> bool:
     await ensure_user_client_connected()
-    if user_client:
-        return await user_client.is_user_authorized()
-    return False
+    return await user_client.is_user_authorized()
 
 # ==========================
 # ПРОВЕРКА ПОДПИСКИ
@@ -440,36 +290,20 @@ async def check_sub(callback: CallbackQuery):
         await callback.answer("❌ Подписка не найдена", show_alert=True)
 
 # ==========================
-# АВТОРИЗАЦИЯ СЕССИЙ
+# АВТОРИЗАЦИЯ (СТАРЫЙ СТИЛЬ)
 # ==========================
 
-@dp.callback_query(F.data == "add_session_btn")
-async def add_session_btn(callback: CallbackQuery, state: FSMContext):
-    if not is_admin_user(callback.from_user.id):
-        await callback.answer("⛔ Только для админа")
+@dp.message(Command("add_session"))
+async def add_session_command(message: Message, state: FSMContext):
+    if not is_admin_user(message.from_user.id):
+        await message.answer("⛔ Только для администратора")
         return
-    await callback.message.answer(
-        "📱 ДОБАВЛЕНИЕ СЕССИИ\n\n"
-        "Введите название для сессии (например: main, work, bot):"
-    )
-    await state.set_state(AuthState.waiting_session_name)
-    await callback.answer()
-
-@dp.message(AuthState.waiting_session_name)
-async def session_name_input(message: Message, state: FSMContext):
-    session_name = message.text.strip().replace(" ", "_")
-    if not session_name:
-        await message.answer("❌ Название не может быть пустым")
+    if await is_user_client_authorized():
+        await message.answer("✅ Сессия уже добавлена")
         return
-    
-    if session_name in sessions:
-        await message.answer(f"❌ Сессия с именем '{session_name}' уже существует\n\nВведите другое имя:")
-        return
-    
-    await state.update_data(session_name=session_name)
     await state.set_state(AuthState.waiting_phone)
     await message.answer(
-        f"📱 Сессия: {session_name}\n\n"
+        "📱 ДОБАВЛЕНИЕ СЕССИИ\n\n"
         "Введите номер телефона:\n"
         "Пример: +79991234567\n\n"
         "❌ Отмена — /cancel"
@@ -480,116 +314,57 @@ async def auth_phone(message: Message, state: FSMContext):
     phone = message.text.strip()
     if not phone.startswith("+"):
         phone = "+" + phone
-    
-    data = await state.get_data()
-    session_name = data.get("session_name")
-    
-    session_file = get_session_file(session_name)
-    temp_client = TelegramClient(session_file, API_ID, API_HASH)
-    await temp_client.connect()
-    
+    await ensure_user_client_connected()
     try:
-        await temp_client.send_code_request(phone)
-        await state.update_data(phone=phone, session_name=session_name)
+        await user_client.send_code_request(phone)
+        await state.update_data(phone=phone)
         await state.set_state(AuthState.waiting_code)
-        await message.answer(
-            f"✅ Код отправлен для сессии {session_name}!\n\n"
-            "Введите код из Telegram:\n"
-            "Если не приходит — напишите 'resend'"
-        )
+        await message.answer("✅ Код отправлен!\n\nВведите код из Telegram:")
     except PhoneNumberInvalidError:
         await message.answer("❌ Неверный номер")
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
-    finally:
-        await temp_client.disconnect()
 
 @dp.message(AuthState.waiting_code)
 async def auth_code(message: Message, state: FSMContext):
-    data = await state.get_data()
-    session_name = data.get("session_name")
-    phone = data.get("phone")
-    
-    if message.text.strip().lower() in ["resend", "повторно", "ещё"]:
-        temp_client = TelegramClient(get_session_file(session_name), API_ID, API_HASH)
-        await temp_client.connect()
-        try:
-            await temp_client.send_code_request(phone)
-            await message.answer(f"✅ Код повторно отправлен для {session_name}!")
-        except Exception as e:
-            await message.answer(f"❌ Ошибка: {e}")
-        finally:
-            await temp_client.disconnect()
-        return
-    
     code = "".join(ch for ch in message.text.strip() if ch.isdigit())
     if len(code) < 4:
-        await message.answer("❌ Код слишком короткий\n\nЕсли не приходит, напишите 'resend'")
+        await message.answer("❌ Код слишком короткий")
         return
-    
-    temp_client = TelegramClient(get_session_file(session_name), API_ID, API_HASH)
-    await temp_client.connect()
-    
+    data = await state.get_data()
+    phone = data.get("phone")
     try:
-        await temp_client.sign_in(phone=phone, code=code)
-        me = await temp_client.get_me()
-        name = me.first_name or me.username or str(me.id)
-        
-        await add_new_session(session_name, phone)
-        sessions[session_name]["authorized"] = True
-        sessions[session_name]["account_name"] = name
-        save_sessions()
-        
+        await user_client.sign_in(phone=phone, code=code)
         await state.clear()
-        await message.answer(
-            f"✅ Сессия '{session_name}' создана!\n"
-            f"👤 Аккаунт: {name}\n\n"
-            f"Теперь активируйте её в админ-панели."
-        )
+        await finish_auth_success(message)
     except SessionPasswordNeededError:
         await state.set_state(AuthState.waiting_password)
         await message.answer("🔐 Введите пароль от двухфакторной авторизации:")
     except PhoneCodeInvalidError:
-        await message.answer("❌ Неверный код\n\nЕсли не приходит, напишите 'resend'")
+        await message.answer("❌ Неверный код")
     except PhoneCodeExpiredError:
-        await message.answer("❌ Код истёк. Напишите 'resend' для повторной отправки")
+        await message.answer("❌ Код истёк. Начните заново: /add_session")
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
-    finally:
-        await temp_client.disconnect()
 
 @dp.message(AuthState.waiting_password)
 async def auth_password(message: Message, state: FSMContext):
-    data = await state.get_data()
-    session_name = data.get("session_name")
-    phone = data.get("phone")
     password = message.text.strip()
-    
-    temp_client = TelegramClient(get_session_file(session_name), API_ID, API_HASH)
-    await temp_client.connect()
-    
     try:
-        await temp_client.sign_in(password=password)
-        me = await temp_client.get_me()
-        name = me.first_name or me.username or str(me.id)
-        
-        await add_new_session(session_name, phone)
-        sessions[session_name]["authorized"] = True
-        sessions[session_name]["account_name"] = name
-        save_sessions()
-        
+        await user_client.sign_in(password=password)
         await state.clear()
-        await message.answer(
-            f"✅ Сессия '{session_name}' создана!\n"
-            f"👤 Аккаунт: {name}\n\n"
-            f"Теперь активируйте её в админ-панели."
-        )
+        await finish_auth_success(message)
     except PasswordHashInvalidError:
         await message.answer("❌ Неверный пароль")
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}")
-    finally:
-        await temp_client.disconnect()
+
+async def finish_auth_success(message: Message):
+    me = await user_client.get_me()
+    name = me.first_name or me.username or str(me.id)
+    await message.answer(f"✅ Сессия добавлена!\n👤 Аккаунт: {name}\n\nЗагружаю модели...")
+    await load_base_gifts()
+    await message.answer(f"✅ Готово!\n📦 Моделей: {len(BASE_GIFTS)}\n\nНажми /start")
 
 # ==========================
 # ЗАГРУЗКА МОДЕЛЕЙ
@@ -637,7 +412,7 @@ async def ensure_models_loaded():
         await load_base_gifts()
 
 # ==========================
-# РАБОТА С ВЛАДЕЛЬЦАМИ (С ЮЗЕРНЕЙМАМИ)
+# РАБОТА С ВЛАДЕЛЬЦАМИ
 # ==========================
 
 async def resolve_owner_info(raw_gift: Any) -> OwnerInfo:
@@ -661,7 +436,7 @@ async def resolve_owner_info(raw_gift: Any) -> OwnerInfo:
                 OWNER_CACHE[user_id] = info
             return info
     
-    if user_id and user_client:
+    if user_id:
         try:
             await ensure_user_client_connected()
             entity = await user_client.get_entity(user_id)
@@ -686,7 +461,7 @@ async def resolve_owner_info(raw_gift: Any) -> OwnerInfo:
             OWNER_CACHE[user_id] = info
             return info
         except FloodWaitError as e:
-            log.warning(f"FloodWait {e.seconds}s for user {user_id}, waiting...")
+            log.warning(f"FloodWait {e.seconds}s for user {user_id}")
             await asyncio.sleep(e.seconds + 1)
         except Exception as e:
             log.debug(f"Could not get entity for {user_id}: {e}")
@@ -855,6 +630,23 @@ async def get_full_market_state(
     return results, num_map
 
 # ==========================
+# ФОРМАТИРОВАНИЕ
+# ==========================
+
+def format_gift_list(gifts: List[MarketGift]) -> str:
+    lines = []
+    for i, g in enumerate(gifts, 1):
+        num = f" #{g.num}" if g.num else ""
+        owner = f"@{g.owner.username}" if g.owner.username else g.owner.label
+        lines.append(
+            f"{i}. {g.title}{num}\n"
+            f"💰 Цена: {g.price} ⭐\n"
+            f"👤 Владелец: {owner}\n"
+            f"🔗 {g.link}"
+        )
+    return "\n\n".join(lines)
+
+# ==========================
 # КЛАВИАТУРЫ
 # ==========================
 
@@ -863,51 +655,20 @@ def main_menu_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🎁 ВЫБРАТЬ МОДЕЛЬ", callback_data="models:0")],
         [InlineKeyboardButton(text="🚫 ЧЁРНЫЙ СПИСОК", callback_data="owners_blacklist")],
     ]
+    if MONITOR_CHAT_ID and is_admin_user(user_id):
+        rows.insert(1, [InlineKeyboardButton(text="📡 МОНИТОРИНГ", callback_data="monitor_admin_panel")])
     if is_admin_user(user_id):
         rows.append([InlineKeyboardButton(text="⚙️ АДМИН-ПАНЕЛЬ", callback_data="admin_panel")])
-    if MONITOR_CHAT_ID and is_admin_user(user_id):
-        rows.insert(2, [InlineKeyboardButton(text="📡 МОНИТОРИНГ", callback_data="monitor_admin_panel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def admin_panel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📂 УПРАВЛЕНИЕ СЕССИЯМИ", callback_data="sessions_list")],
+        [InlineKeyboardButton(text="🔐 ПРОВЕРИТЬ СЕССИЮ", callback_data="check_session")],
+        [InlineKeyboardButton(text="➕ ДОБАВИТЬ СЕССИЮ", callback_data="add_session_btn")],
         [InlineKeyboardButton(text="🔄 ОБНОВИТЬ МОДЕЛИ", callback_data="reload_models")],
         [InlineKeyboardButton(text="📊 СТАТУС БОТА", callback_data="bot_status")],
         [InlineKeyboardButton(text="🏠 ГЛАВНОЕ", callback_data="menu")]
     ])
-
-def sessions_list_keyboard() -> InlineKeyboardMarkup:
-    rows = []
-    for name, data in sessions.items():
-        status = "✅" if data.get("active", False) else "⏸️"
-        auth = "🔐" if data.get("authorized", False) else "❌"
-        label = data.get("account_name", name)
-        rows.append([
-            InlineKeyboardButton(
-                text=f"{status} {auth} {label}",
-                callback_data=f"session_info:{name}"
-            )
-        ])
-    
-    rows.append([InlineKeyboardButton(text="➕ ДОБАВИТЬ СЕССИЮ", callback_data="add_session_btn")])
-    rows.append([InlineKeyboardButton(text="🏠 ГЛАВНОЕ", callback_data="menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def session_actions_keyboard(session_name: str) -> InlineKeyboardMarkup:
-    is_active = sessions.get(session_name, {}).get("active", False)
-    is_authorized = sessions.get(session_name, {}).get("authorized", False)
-    
-    rows = []
-    if is_authorized and not is_active:
-        rows.append([InlineKeyboardButton(text="✅ АКТИВИРОВАТЬ", callback_data=f"session_activate:{session_name}")])
-    if is_active:
-        rows.append([InlineKeyboardButton(text="⏹️ ДЕАКТИВИРОВАТЬ", callback_data=f"session_deactivate:{session_name}")])
-    if not is_active:
-        rows.append([InlineKeyboardButton(text="🗑️ УДАЛИТЬ", callback_data=f"session_delete:{session_name}")])
-    rows.append([InlineKeyboardButton(text="🔙 НАЗАД К СПИСКУ", callback_data="sessions_list")])
-    rows.append([InlineKeyboardButton(text="🏠 ГЛАВНОЕ", callback_data="menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def models_keyboard(page: int = 0) -> InlineKeyboardMarkup:
     total = len(BASE_GIFTS)
@@ -974,14 +735,9 @@ async def admin_panel(callback: CallbackQuery):
         await callback.answer("⛔ Только для админа")
         return
     status = "✅ АКТИВНА" if await is_user_client_authorized() else "❌ НЕ АКТИВНА"
-    session_name = active_session_name or "Нет"
-    sessions_count = len(sessions)
-    
     await callback.message.edit_text(
         f"⚙️ АДМИН-ПАНЕЛЬ\n\n"
-        f"🔐 Текущая сессия: {session_name}\n"
-        f"📊 Статус: {status}\n"
-        f"📂 Всего сессий: {sessions_count}\n"
+        f"🔐 Сессия: {status}\n"
         f"📦 Моделей: {len(BASE_GIFTS)}\n"
         f"📡 Мониторинг: {'🟢 ВКЛ' if monitor_running else '🔴 ВЫКЛ'}\n"
         f"🚫 В черном списке: {len(OWNERS_BLACKLIST)}",
@@ -989,147 +745,32 @@ async def admin_panel(callback: CallbackQuery):
     )
     await callback.answer()
 
-@dp.callback_query(F.data == "sessions_list")
-async def sessions_list(callback: CallbackQuery):
+@dp.callback_query(F.data == "check_session")
+async def check_session_callback(callback: CallbackQuery):
     if not is_admin_user(callback.from_user.id):
         await callback.answer("⛔ Только для админа")
         return
-    
-    if not sessions:
-        await callback.message.edit_text(
-            "📂 УПРАВЛЕНИЕ СЕССИЯМИ\n\n"
-            "❌ Нет сохранённых сессий\n\n"
-            "Нажми ➕ ДОБАВИТЬ СЕССИЮ для создания",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="➕ ДОБАВИТЬ СЕССИЮ", callback_data="add_session_btn")],
-                [InlineKeyboardButton(text="🏠 ГЛАВНОЕ", callback_data="menu")]
-            ])
-        )
-        await callback.answer()
-        return
-    
-    text = "📂 УПРАВЛЕНИЕ СЕССИЯМИ\n\n"
-    for name, data in sessions.items():
-        status = "🟢 АКТИВНА" if data.get("active", False) else "⏸️ НЕ АКТИВНА"
-        auth = "🔐 Авторизована" if data.get("authorized", False) else "❌ Не авторизована"
-        account = data.get("account_name", "—")
-        phone = data.get("phone", "—")
-        text += f"┌ {name}\n├ {status}\n├ {auth}\n├ 👤 {account}\n└ 📱 {phone}\n\n"
-    
-    await callback.message.edit_text(text, reply_markup=sessions_list_keyboard())
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("session_info:"))
-async def session_info(callback: CallbackQuery):
-    if not is_admin_user(callback.from_user.id):
-        await callback.answer("⛔ Только для админа")
-        return
-    
-    session_name = callback.data.split(":", 1)[1]
-    data = sessions.get(session_name)
-    if not data:
-        await callback.answer("Сессия не найдена")
-        return
-    
-    status = "🟢 АКТИВНА" if data.get("active", False) else "⏸️ НЕ АКТИВНА"
-    auth = "🔐 Авторизована" if data.get("authorized", False) else "❌ Не авторизована"
-    account = data.get("account_name", "—")
-    phone = data.get("phone", "—")
-    created = data.get("created", "—")
-    
-    text = (
-        f"📂 СЕССИЯ: {session_name}\n\n"
-        f"📊 Статус: {status}\n"
-        f"🔐 Авторизация: {auth}\n"
-        f"👤 Аккаунт: {account}\n"
-        f"📱 Телефон: {phone}\n"
-        f"📅 Создана: {created[:19] if created != '—' else '—'}"
-    )
-    
-    await callback.message.edit_text(text, reply_markup=session_actions_keyboard(session_name))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("session_activate:"))
-async def session_activate(callback: CallbackQuery):
-    if not is_admin_user(callback.from_user.id):
-        await callback.answer("⛔ Только для админа")
-        return
-    
-    session_name = callback.data.split(":", 1)[1]
-    
-    if session_name not in sessions:
-        await callback.answer("Сессия не найдена")
-        return
-    
-    if not sessions[session_name].get("authorized", False):
-        await callback.answer("❌ Сессия не авторизована!", show_alert=True)
-        return
-    
-    await callback.answer(f"🔄 Активирую {session_name}...")
-    
-    success = await switch_session(session_name)
-    if success:
-        await callback.answer(f"✅ Сессия {session_name} активирована!", show_alert=True)
-        await load_base_gifts()
+    if await is_user_client_authorized():
+        me = await user_client.get_me()
+        name = me.first_name or me.username or str(me.id)
+        await callback.answer(f"✅ Сессия активна\nАккаунт: {name}", show_alert=True)
     else:
-        await callback.answer(f"❌ Не удалось активировать {session_name}", show_alert=True)
-    
-    await session_info(callback)
+        await callback.answer("❌ Сессия не активна!\nИспользуй /add_session", show_alert=True)
+    await admin_panel(callback)
 
-@dp.callback_query(F.data.startswith("session_deactivate:"))
-async def session_deactivate(callback: CallbackQuery):
+@dp.callback_query(F.data == "add_session_btn")
+async def add_session_btn(callback: CallbackQuery, state: FSMContext):
     if not is_admin_user(callback.from_user.id):
         await callback.answer("⛔ Только для админа")
         return
-    
-    session_name = callback.data.split(":", 1)[1]
-    
-    if session_name not in sessions:
-        await callback.answer("Сессия не найдена")
-        return
-    
-    sessions[session_name]["active"] = False
-    save_sessions()
-    
-    global active_session_name
-    if active_session_name == session_name:
-        active_session_name = None
-        save_active_session(None)
-    
-    await callback.answer(f"⏸️ Сессия {session_name} деактивирована")
-    await session_info(callback)
-
-@dp.callback_query(F.data.startswith("session_delete:"))
-async def session_delete(callback: CallbackQuery):
-    if not is_admin_user(callback.from_user.id):
-        await callback.answer("⛔ Только для админа")
-        return
-    
-    session_name = callback.data.split(":", 1)[1]
-    
-    await callback.message.edit_text(
-        f"⚠️ УДАЛИТЬ СЕССИЮ?\n\n"
-        f"Сессия: {session_name}\n"
-        f"Аккаунт: {sessions.get(session_name, {}).get('account_name', '—')}\n\n"
-        f"Файл сессии будет удалён без возможности восстановления.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🗑️ ДА, УДАЛИТЬ", callback_data=f"session_confirm_delete:{session_name}")],
-            [InlineKeyboardButton(text="❌ ОТМЕНА", callback_data=f"session_info:{session_name}")]
-        ])
+    await callback.message.answer(
+        "📱 ДОБАВЛЕНИЕ СЕССИИ\n\n"
+        "Введите номер телефона:\n"
+        "Пример: +79991234567\n\n"
+        "❌ Отмена — /cancel"
     )
+    await state.set_state(AuthState.waiting_phone)
     await callback.answer()
-
-@dp.callback_query(F.data.startswith("session_confirm_delete:"))
-async def session_confirm_delete(callback: CallbackQuery):
-    if not is_admin_user(callback.from_user.id):
-        await callback.answer("⛔ Только для админа")
-        return
-    
-    session_name = callback.data.split(":", 1)[1]
-    
-    await delete_session(session_name)
-    await callback.answer(f"🗑️ Сессия {session_name} удалена")
-    await sessions_list(callback)
 
 @dp.callback_query(F.data == "reload_models")
 async def reload_models_callback(callback: CallbackQuery):
@@ -1146,20 +787,15 @@ async def bot_status_callback(callback: CallbackQuery):
     if not is_admin_user(callback.from_user.id):
         await callback.answer("⛔ Только для админа")
         return
-    
-    session_name = active_session_name or "Нет"
     is_auth = await is_user_client_authorized()
-    
     status_text = (
         f"📊 СТАТУС БОТА\n\n"
         f"🤖 Бот: @{bot.username}\n"
-        f"📂 Активная сессия: {session_name}\n"
         f"🔐 Сессия: {'✅ АКТИВНА' if is_auth else '❌ НЕ АКТИВНА'}\n"
         f"📦 Моделей: {len(BASE_GIFTS)}\n"
         f"📡 Мониторинг: {'🟢 ВКЛ' if monitor_running else '🔴 ВЫКЛ'}\n"
         f"🚫 В черном списке: {len(OWNERS_BLACKLIST)}\n"
-        f"📤 Отправлено монитором: {len(SENT_MONITOR_SLUGS)}\n"
-        f"📸 Снимков рынка: {len(market_snapshots)}"
+        f"📤 Отправлено монитором: {len(SENT_MONITOR_SLUGS)}"
     )
     await callback.message.edit_text(status_text)
     await callback.answer()
@@ -1232,8 +868,7 @@ async def monitor_worker():
                             continue
                         
                         owner_display = f"@{gift.owner.username}" if gift.owner.username else gift.owner.label
-                        owner_link = gift.owner.link or f"https://t.me/{gift.owner.username}" if gift.owner.username else None
-                        
+                        owner_link = gift.owner.link
                         if owner_link:
                             owner_text = f"[{owner_display}]({owner_link})"
                         else:
@@ -1392,24 +1027,17 @@ async def clear_blacklist(callback: CallbackQuery):
 async def cmd_start(message: Message):
     if not await ensure_access(message):
         return
-    
-    is_auth = await is_user_client_authorized()
-    
-    if not is_auth:
+    if not await is_user_client_authorized():
         if is_admin_user(message.from_user.id):
             await message.answer(
-                "⚠️ Нет активной сессии!\n\n"
-                "Зайдите в АДМИН-ПАНЕЛЬ → УПРАВЛЕНИЕ СЕССИЯМИ\n"
-                "И активируйте или добавьте сессию.",
+                "⚠️ Сессия не добавлена!\n\nИспользуй /add_session",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="⚙️ АДМИН-ПАНЕЛЬ", callback_data="admin_panel")],
                     [InlineKeyboardButton(text="➕ ДОБАВИТЬ СЕССИЮ", callback_data="add_session_btn")]
                 ])
             )
         else:
             await message.answer("⚠️ Бот настраивается. Подождите.")
         return
-    
     await ensure_models_loaded()
     await message.answer(
         "🎁 ПАРСЕР ПОДАРКОВ\n\n"
@@ -1594,7 +1222,7 @@ async def main():
 
     log.info(f"Loaded: blacklist={len(OWNERS_BLACKLIST)}, seen={len(SEEN_GIFTS_BY_QUERY)}, monitor={len(SENT_MONITOR_SLUGS)}, snapshots={len(market_snapshots)}")
 
-    await init_session_manager()
+    await ensure_user_client_connected()
 
     if await is_user_client_authorized():
         me = await user_client.get_me()
@@ -1608,7 +1236,7 @@ async def main():
             monitor_task = asyncio.create_task(monitor_worker())
             log.info("Monitor started")
     else:
-        log.info("No active session. Admin must add or activate session.")
+        log.info("Telethon not authorized. Admin must run /add_session")
 
     await dp.start_polling(bot)
 
