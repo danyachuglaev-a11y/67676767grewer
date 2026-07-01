@@ -33,14 +33,14 @@ from telethon.tl.types import PeerUser
 API_ID = 26259835
 API_HASH = "3fa32264398920f001dd2428b42060f6"
 BOT_TOKEN = "8206373294:AAEeZp8zrOquQeWrPHL7SJ4nG-mp3nfivrI"
-ADMIN_ID = 8855434638
+ADMIN_ID = 8002472821
 
 # Канал для подписки (если нужен)
 REQUIRED_CHANNEL = "@pupuhop"
 REQUIRED_CHANNEL_URL = "https://t.me/pupuhop"
 
 # ID группы для мониторинга
-MONITOR_CHAT_ID = -1004223195405
+MONITOR_CHAT_ID = -1004358773774
 MONITOR_INTERVAL = 60
 
 # ==========================
@@ -95,19 +95,6 @@ DELAY_BETWEEN_BATCHES = bot_settings["delay_between_batches"]
 last_send_time_by_model: Dict[str, float] = {}
 
 PAID_MESSAGES_CACHE: Dict[int, bool] = {}
-
-# Фильтр арабских символов: пропускаем владельцев, у которых
-# в имени, username или label есть символы арабского письма.
-ARABIC_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]")
-
-
-def has_arabic_symbols(*values: Any) -> bool:
-    for value in values:
-        if value is None:
-            continue
-        if ARABIC_RE.search(str(value)):
-            return True
-    return False
 
 
 @dataclass
@@ -393,45 +380,31 @@ async def finish_auth_success(message: Message):
 async def load_base_gifts() -> List[BaseGift]:
     global BASE_GIFTS, BASE_GIFTS_BY_ID
     log.info("Loading base star gifts...")
-
     result = await user_client(functions.payments.GetStarGiftsRequest(hash=0))
     raw_gifts = getattr(result, "gifts", []) or []
-    log.info("Raw gifts received: %s", len(raw_gifts))
-
-    gifts: List[BaseGift] = []
-    skipped = 0
-
+    gifts = []
     for raw in raw_gifts:
         gift_id = safe_int(get_field(raw, "id"))
-        if not gift_id:
-            skipped += 1
+        title = get_field(raw, "title")
+        if not gift_id or not title:
             continue
-
-        # В новых ответах Telegram у StarGift часто нет title и availability_resale.
-        # Поэтому НЕ фильтруем по availability_resale и даём резервное название.
-        sticker = get_field(raw, "sticker")
-        title = (
-            get_field(raw, "title")
-            or get_field(raw, "name")
-            or get_field(sticker, "emoji")
-            or f"Gift {gift_id}"
-        )
-
+        availability_resale = get_field(raw, "availability_resale")
+        if not availability_resale:
+            continue
         gifts.append(BaseGift(
             gift_id=gift_id,
             title=str(title),
-            stars=safe_int(get_field(raw, "stars"), 0),
-            availability_resale=safe_int(get_field(raw, "availability_resale"), 0),
-            resell_min_stars=safe_int(get_field(raw, "resell_min_stars"), 0),
+            stars=get_field(raw, "stars"),
+            availability_resale=safe_int(availability_resale),
+            resell_min_stars=safe_int(get_field(raw, "resell_min_stars")),
             sold_out=get_field(raw, "sold_out"),
         ))
-
     gifts.sort(key=lambda g: (g.resell_min_stars or 999999, g.title.lower()))
     BASE_GIFTS = gifts
     BASE_GIFTS_BY_ID = {g.gift_id: g for g in gifts}
-
-    log.info("Loaded %s base gifts, skipped %s", len(gifts), skipped)
+    log.info("Loaded %s base gifts", len(gifts))
     return gifts
+
 
 async def ensure_models_loaded():
     if not BASE_GIFTS:
@@ -619,11 +592,6 @@ async def find_market_gifts(
                 return found
             owner = await resolve_owner_info(raw)
             if is_owner_blacklisted(owner.key):
-                continue
-
-            # Пропускаем владельцев с арабскими символами в профиле/username.
-            if has_arabic_symbols(owner.username, owner.label, owner.key):
-                log.debug(f"Skipping {slug} - owner has Arabic symbols: {owner.display}")
                 continue
             
             owner_id_raw = get_field(raw, "owner_id")
@@ -1095,7 +1063,7 @@ async def cancel_cmd(message: Message, state: FSMContext):
 # ==========================
 
 async def main():
-    global OWNERS_BLACKLIST, SEEN_GIFTS_BY_QUERY, SENT_MONITOR_SLUGS, bot_settings, LINKS_PER_MESSAGE, DELAY_BETWEEN_BATCHES, monitor_running, monitor_task
+    global OWNERS_BLACKLIST, SEEN_GIFTS_BY_QUERY, SENT_MONITOR_SLUGS, bot_settings, LINKS_PER_MESSAGE, DELAY_BETWEEN_BATCHES
 
     OWNERS_BLACKLIST = load_owners_blacklist()
     SEEN_GIFTS_BY_QUERY = load_seen_gifts()
