@@ -380,39 +380,44 @@ async def finish_auth_success(message: Message):
 async def load_base_gifts() -> List[BaseGift]:
     global BASE_GIFTS, BASE_GIFTS_BY_ID
     log.info("Loading base star gifts...")
+
     result = await user_client(functions.payments.GetStarGiftsRequest(hash=0))
     raw_gifts = getattr(result, "gifts", []) or []
 
     gifts = []
-    skipped = 0
-
     for raw in raw_gifts:
         gift_id = safe_int(get_field(raw, "id"))
         if not gift_id:
-            skipped += 1
             continue
 
-        title = (
-            get_field(raw, "title")
-            or get_field(raw, "name")
-            or get_field(get_field(raw, "sticker"), "emoji")
-            or f"Gift {gift_id}"
-        )
+        title = get_field(raw, "title")
+
+        # ВАЖНО: не фильтруем по availability_resale.
+        # Telegram может отдавать это поле пустым, из-за чего старый код грузил 0 моделей.
+        availability_resale = safe_int(get_field(raw, "availability_resale"))
+
+        # Если Telegram не отдал title, берём только нейтральное название без ID/номера.
+        # Так модели не будут отображаться как Gift 123456789.
+        if not title:
+            sticker = get_field(raw, "sticker")
+            emoji = get_field(sticker, "emoji")
+            title = f"{emoji} Gift" if emoji else "🎁 Gift"
 
         gifts.append(BaseGift(
             gift_id=gift_id,
             title=str(title),
             stars=get_field(raw, "stars"),
-            availability_resale=safe_int(get_field(raw, "availability_resale"), 0),
-            resell_min_stars=safe_int(get_field(raw, "resell_min_stars"), 0),
+            availability_resale=availability_resale,
+            resell_min_stars=safe_int(get_field(raw, "resell_min_stars")),
             sold_out=get_field(raw, "sold_out"),
         ))
 
     gifts.sort(key=lambda g: (g.resell_min_stars or 999999, g.title.lower()))
     BASE_GIFTS = gifts
     BASE_GIFTS_BY_ID = {g.gift_id: g for g in gifts}
-    log.info("Loaded %s base gifts, skipped %s", len(gifts), skipped)
+    log.info("Loaded %s base gifts", len(gifts))
     return gifts
+
 
 async def ensure_models_loaded():
     if not BASE_GIFTS:
