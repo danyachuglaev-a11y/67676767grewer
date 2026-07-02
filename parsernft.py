@@ -2,7 +2,9 @@ import asyncio
 import json
 import logging
 import random
+import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
 
 from aiogram import Bot, Dispatcher, F
@@ -31,7 +33,7 @@ from telethon.tl.types import PeerUser
 
 
 # ============================================================
-# НАСТРОЙКИ — ВЗЯЛ СТАРЫЕ
+# НАСТРОЙКИ
 # ============================================================
 
 API_ID = 26259835
@@ -39,16 +41,9 @@ API_HASH = "3fa32264398920f001dd2428b42060f6"
 BOT_TOKEN = "8206373294:AAEeZp8zrOquQeWrPHL7SJ4nG-mp3nfivrI"
 ADMIN_ID = 8855434638
 
-# Канал для подписки, если нужен
 REQUIRED_CHANNEL = "@pupuhop"
 REQUIRED_CHANNEL_URL = "https://t.me/pupuhop"
-
-# Группа, куда мониторинг будет кидать новые подарки
 MONITOR_CHAT_ID = -1004358773774
-
-# ============================================================
-# ОСНОВНЫЕ ПАРАМЕТРЫ
-# ============================================================
 
 SESSION_NAME = "telethon_market_userbot"
 
@@ -57,14 +52,12 @@ SEARCH_RESULT_LIMIT = 10
 REQUEST_PAGE_LIMIT = 50
 MAX_MARKET_PAGES = 30
 
-# Мониторинг
-MONITOR_INTERVAL = 60          # как часто проверять маркет, секунды
-MONITOR_MODELS_LIMIT = 25      # сколько моделей проверять за цикл
-MONITOR_PER_MODEL_LIMIT = 8    # сколько подарков брать с одной модели
-MONITOR_SEND_LIMIT = 20        # максимум новых подарков за один цикл
-MONITOR_WARMUP_ON_START = True # при старте пометить текущие подарки как старые, чтобы не спамить старьём
+MONITOR_INTERVAL = 60
+MONITOR_MODELS_LIMIT = 25
+MONITOR_PER_MODEL_LIMIT = 8
+MONITOR_SEND_LIMIT = 20
+MONITOR_WARMUP_ON_START = True
 
-# Файлы
 SEEN_MANUAL_FILE = "seen_manual.json"
 MONITOR_SEEN_FILE = "monitor_seen_slugs.json"
 OWNER_BLACKLIST_FILE = "owner_blacklist.json"
@@ -314,12 +307,6 @@ async def resolve_owner_info(raw_gift: Any) -> OwnerInfo:
 
 
 def extract_stars_amount(value: Any) -> int:
-    """
-    Telegram может вернуть:
-    - StarsAmount
-    - список [StarsAmount, StarsTonAmount]
-    - int
-    """
     if value is None:
         return 0
 
@@ -532,10 +519,6 @@ async def finish_auth(message: Message):
 # ============================================================
 
 async def load_base_gifts() -> List[BaseGift]:
-    """
-    Telegram отдаёт часть StarGift без title и без availability_resale.
-    Такие модели не показываем, чтобы не было Gift 12345 и пустых моделей.
-    """
     global BASE_GIFTS, BASE_GIFTS_BY_ID
 
     log.info("Loading base star gifts...")
@@ -605,14 +588,6 @@ async def get_resale_page(
     limit: int = REQUEST_PAGE_LIMIT,
     sort_by_price: bool = True,
 ):
-    """
-    Совместимый запрос resale-подарков.
-
-    На разных версиях Telethon конструктор GetResaleStarGiftsRequest
-    может отличаться: где-то есть stars_only/for_craft, а где-то их нет.
-    Поэтому сначала пробуем новый вариант, а если хост ругается TypeError —
-    автоматически используем старый вариант без этих аргументов.
-    """
     while True:
         try:
             try:
@@ -773,6 +748,7 @@ def main_menu_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
 
     if is_admin(user_id):
         rows.append([InlineKeyboardButton(text="📡 МОНИТОРИНГ", callback_data="monitor_panel")])
+        rows.append([InlineKeyboardButton(text="⚙️ АДМИН-ПАНЕЛЬ", callback_data="admin_panel")])
         rows.append([InlineKeyboardButton(text="🔄 ОБНОВИТЬ МОДЕЛИ", callback_data="reload_models")])
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -850,15 +826,111 @@ def monitor_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def admin_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔐 ПРОВЕРИТЬ СЕССИЮ", callback_data="check_session_admin")],
+        [InlineKeyboardButton(text="➕ ДОБАВИТЬ СЕССИЮ", callback_data="add_session_btn")],
+        [InlineKeyboardButton(text="📊 СТАТУС БОТА", callback_data="bot_status")],
+        [InlineKeyboardButton(text="🏠 ГЛАВНОЕ", callback_data="menu")]
+    ])
+
+
+# ============================================================
+# АДМИН-ПАНЕЛЬ
+# ============================================================
+
+@dp.callback_query(F.data == "admin_panel")
+async def admin_panel(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Только для админа")
+        return
+
+    is_auth = await is_user_client_authorized()
+    status = "✅ АКТИВНА" if is_auth else "❌ НЕ АКТИВНА"
+    me = await user_client.get_me() if is_auth else None
+    account = f"{me.first_name} (@{me.username})" if me else "—"
+
+    await callback.message.edit_text(
+        f"⚙️ *АДМИН-ПАНЕЛЬ*\n\n"
+        f"🔐 Сессия: {status}\n"
+        f"👤 Аккаунт: {account}\n"
+        f"📦 Моделей: {len(BASE_GIFTS)}\n"
+        f"📡 Мониторинг: {'🟢 ВКЛ' if monitor_running else '🔴 ВЫКЛ'}\n"
+        f"🚫 В черном списке: {len(OWNER_BLACKLIST)}\n"
+        f"📤 Запомнено slug: {len(MONITOR_SEEN_SLUGS)}",
+        parse_mode="Markdown",
+        reply_markup=admin_panel_keyboard()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "check_session_admin")
+async def check_session_admin(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Только для админа")
+        return
+
+    if await is_user_client_authorized():
+        me = await user_client.get_me()
+        await callback.answer(
+            f"✅ Сессия активна\n"
+            f"👤 {me.first_name} (@{me.username})",
+            show_alert=True
+        )
+    else:
+        await callback.answer("❌ Сессия не активна!\nИспользуй /add_session", show_alert=True)
+
+    await admin_panel(callback)
+
+
+@dp.callback_query(F.data == "add_session_btn")
+async def add_session_btn(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Только для админа")
+        return
+
+    await callback.message.answer(
+        "📱 ДОБАВЛЕНИЕ СЕССИИ\n\n"
+        "Введите номер телефона:\n"
+        "Пример: +79991234567\n\n"
+        "❌ Отмена — /cancel"
+    )
+    await state.set_state(AuthState.waiting_phone)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "bot_status")
+async def bot_status_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Только для админа")
+        return
+
+    is_auth = await is_user_client_authorized()
+    me = await user_client.get_me() if is_auth else None
+
+    text = (
+        f"📊 *СТАТУС БОТА*\n\n"
+        f"🤖 Бот: @{bot.username}\n"
+        f"🔐 Сессия: {'✅ АКТИВНА' if is_auth else '❌ НЕ АКТИВНА'}\n"
+    )
+    if me:
+        text += f"👤 Аккаунт: {me.first_name} (@{me.username})\n"
+    text += (
+        f"📦 Моделей: {len(BASE_GIFTS)}\n"
+        f"📡 Мониторинг: {'🟢 ВКЛ' if monitor_running else '🔴 ВЫКЛ'}\n"
+        f"🚫 В черном списке: {len(OWNER_BLACKLIST)}\n"
+        f"📤 Запомнено slug: {len(MONITOR_SEEN_SLUGS)}"
+    )
+
+    await callback.message.edit_text(text, parse_mode="Markdown")
+    await callback.answer()
+
+
 # ============================================================
 # МОНИТОРИНГ
 # ============================================================
 
 async def warmup_monitor_seen() -> None:
-    """
-    При первом старте не отправляем старые подарки.
-    Просто запоминаем верхние лоты, а дальше отправляем только то, чего ещё не было.
-    """
     global MONITOR_SEEN_SLUGS
 
     if MONITOR_SEEN_SLUGS:
@@ -945,26 +1017,40 @@ async def send_monitor_gifts(gifts: List[MarketGift]) -> None:
     if not gifts or not MONITOR_CHAT_ID:
         return
 
-    chunks = [gifts[i:i + 10] for i in range(0, len(gifts), 10)]
+    # Проверяем что чат существует
+    try:
+        await bot.get_chat(MONITOR_CHAT_ID)
+    except Exception as e:
+        log.error(f"Monitor chat {MONITOR_CHAT_ID} not found: {e}")
+        return
 
-    for chunk in chunks:
-        text = (
-            f"🆕 *НОВЫЕ ПОДАРКИ НА МАРКЕТЕ*\n"
-            f"Найдено: *{len(chunk)}*\n\n"
-            f"{format_gifts(chunk)}"
+    # ОТПРАВЛЯЕМ ПО ОДНОМУ
+    for gift in gifts:
+        num_text = f" #{gift.num}" if gift.num else ""
+        owner_display = f"@{gift.owner.username}" if gift.owner.username else gift.owner.label
+
+        msg = (
+            f"🆕 *НОВЫЙ ПОДАРОК НА ПРОДАЖЕ*\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+            f"🎁 *{gift.title}{num_text}*\n"
+            f"💰 Цена: *{gift.price}* ⭐\n"
+            f"👤 Владелец: {owner_display}\n"
+            f"🔗 [Купить]({gift.link})\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+            f"⏱ {datetime.now().strftime('%H:%M:%S')}"
         )
 
         try:
             await bot.send_message(
                 MONITOR_CHAT_ID,
-                text,
+                msg,
                 parse_mode="Markdown",
                 disable_web_page_preview=True,
             )
+            log.info(f"Monitor sent: {gift.slug}")
+            await asyncio.sleep(1.5)
         except Exception as e:
-            log.error("Monitor send error: %s", e)
-
-        await asyncio.sleep(random.uniform(2, 4))
+            log.error(f"Monitor send error for {gift.slug}: {e}")
 
 
 async def monitor_worker() -> None:
