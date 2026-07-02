@@ -37,14 +37,14 @@ from telethon.tl.types import PeerUser
 API_ID = 26259835
 API_HASH = "3fa32264398920f001dd2428b42060f6"
 BOT_TOKEN = "8206373294:AAEeZp8zrOquQeWrPHL7SJ4nG-mp3nfivrI"
-ADMIN_ID = 8855434638
+ADMIN_ID = 8986358602
 
 # Канал для подписки, если нужен
-REQUIRED_CHANNEL = "@pupuhop"
-REQUIRED_CHANNEL_URL = "https://t.me/pupuhop"
+REQUIRED_CHANNEL = ""
+REQUIRED_CHANNEL_URL = ""
 
 # Группа, куда мониторинг будет кидать новые подарки
-MONITOR_CHAT_ID = -1004358773774
+MONITOR_CHAT_ID = -1004306033280
 
 # ============================================================
 # ОСНОВНЫЕ ПАРАМЕТРЫ
