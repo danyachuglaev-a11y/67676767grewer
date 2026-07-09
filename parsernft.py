@@ -44,7 +44,7 @@ ADMIN_ID = 8986358602
 
 REQUIRED_CHANNEL = "@qwertyyyyw"
 REQUIRED_CHANNEL_URL = "https://t.me/qwertyyyyw"
-MONITOR_CHAT_ID = -1004439671296
+MONITOR_CHAT_ID = -1003660453372
 
 SESSION_NAME = "telethon_market_userbot"
 
