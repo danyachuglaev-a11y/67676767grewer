@@ -3,7 +3,7 @@ import json
 import logging
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -27,14 +27,14 @@ from telethon.errors import (
     PhoneCodeInvalidError,
     PhoneNumberInvalidError,
     SessionPasswordNeededError,
-    AuthKeyUnregisteredError,  # <-- НОВЫЙ ИМПОРТ ДЛЯ ОТЛОВА КИКНУТОЙ СЕССИИ
+    AuthKeyUnregisteredError,
 )
 from telethon.tl import functions
 from telethon.tl.types import PeerUser
 
 
 # ============================================================
-# НАСТРОЙКИ (БЕЗ ИЗМЕНЕНИЙ)
+# НАСТРОЙКИ
 # ============================================================
 
 API_ID = 26259835
@@ -63,7 +63,8 @@ SEEN_MANUAL_FILE = "seen_manual.json"
 MONITOR_SEEN_FILE = "monitor_seen_slugs.json"
 OWNER_BLACKLIST_FILE = "owner_blacklist.json"
 OWNER_CACHE_FILE = "owner_cache.json"
-WHITELIST_FILE = "whitelist_users.json"  # <-- НОВЫЙ ФАЙЛ ДЛЯ СПИСКА РАЗРЕШЁННЫХ
+WHITELIST_FILE = "whitelist_users.json"
+USER_MONITOR_SESSIONS_FILE = "user_monitor_sessions.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,12 +87,17 @@ SENT_MONITOR_SLUGS: Set[str] = set()
 market_snapshots: Dict[int, Dict[str, Any]] = {}
 PAID_MESSAGES_CACHE: Dict[int, bool] = {}
 OWNER_CACHE: Dict[int, "OwnerInfo"] = {}
-WHITELIST_USERS: Set[int] = set()  # <-- ГЛОБАЛЬНЫЙ СПИСОК ID, КОМУ РАЗРЕШЕН МОНИТОРИНГ
+WHITELIST_USERS: Set[int] = set()
+USER_MONITOR_SESSIONS: Dict[int, "UserMonitorSession"] = {}
 
 monitor_running = False
 monitor_task: Optional[asyncio.Task] = None
-session_alert_sent = False  # <-- ФЛАГ ДЛЯ ОДНОКРАТНОГО ОПОВЕЩЕНИЯ О ПОТЕРЕ СЕССИИ
+session_alert_sent = False
 
+
+# ============================================================
+# ДАТАКЛАССЫ
+# ============================================================
 
 @dataclass
 class BaseGift:
@@ -127,6 +133,19 @@ class MarketGift:
         return f"https://t.me/nft/{self.slug}"
 
 
+@dataclass
+class UserMonitorSession:
+    user_id: int
+    active: bool = False
+    gift_ids: List[int] = field(default_factory=list)
+    min_price: int = 0
+    max_price: int = 999999
+    limit: int = 10
+    seen_slugs: Set[str] = field(default_factory=set)
+    last_results: List[MarketGift] = field(default_factory=list)
+    last_message_id: Optional[int] = None
+
+
 class AuthState(StatesGroup):
     waiting_phone = State()
     waiting_code = State()
@@ -134,7 +153,7 @@ class AuthState(StatesGroup):
 
 
 # ============================================================
-# JSON (ДОБАВЛЕНА ЗАГРУЗКА WHITELIST)
+# JSON
 # ============================================================
 
 def load_json(path: str, default: Any) -> Any:
@@ -201,7 +220,6 @@ def save_owner_cache() -> None:
     save_json(OWNER_CACHE_FILE, OWNER_CACHE)
 
 
-# <-- НОВЫЕ ФУНКЦИИ ДЛЯ WHITELIST -->
 def load_whitelist() -> Set[int]:
     data = load_json(WHITELIST_FILE, [])
     if isinstance(data, list):
@@ -213,15 +231,51 @@ def save_whitelist() -> None:
     save_json(WHITELIST_FILE, sorted(WHITELIST_USERS))
 
 
+def load_user_monitor_sessions() -> Dict[int, UserMonitorSession]:
+    data = load_json(USER_MONITOR_SESSIONS_FILE, {})
+    sessions = {}
+    for uid_str, cfg in data.items():
+        try:
+            uid = int(uid_str)
+            sess = UserMonitorSession(
+                user_id=uid,
+                active=cfg.get("active", False),
+                gift_ids=cfg.get("gift_ids", []),
+                min_price=cfg.get("min_price", 0),
+                max_price=cfg.get("max_price", 999999),
+                limit=cfg.get("limit", 10),
+                seen_slugs=set(cfg.get("seen_slugs", [])),
+                last_message_id=cfg.get("last_message_id")
+            )
+            sessions[uid] = sess
+        except Exception as e:
+            log.error(f"Error loading session {uid_str}: {e}")
+    return sessions
+
+
+def save_user_monitor_sessions() -> None:
+    data = {}
+    for uid, sess in USER_MONITOR_SESSIONS.items():
+        data[str(uid)] = {
+            "active": sess.active,
+            "gift_ids": sess.gift_ids,
+            "min_price": sess.min_price,
+            "max_price": sess.max_price,
+            "limit": sess.limit,
+            "seen_slugs": list(sess.seen_slugs),
+            "last_message_id": sess.last_message_id
+        }
+    save_json(USER_MONITOR_SESSIONS_FILE, data)
+
+
 # ============================================================
-# ВСПОМОГАТЕЛЬНЫЕ (ДОБАВЛЕНА ПРОВЕРКА WHITELIST)
+# ВСПОМОГАТЕЛЬНЫЕ
 # ============================================================
 
 def is_admin(user_id: Optional[int]) -> bool:
     return user_id == ADMIN_ID
 
 
-# <-- НОВАЯ ФУНКЦИЯ: РАЗРЕШЁН ЛИ ПОЛЬЗОВАТЕЛЬ -->
 def is_user_allowed(user_id: Optional[int]) -> bool:
     if not user_id:
         return False
@@ -325,7 +379,6 @@ async def ensure_user_client_connected() -> None:
         await user_client.connect()
 
 
-# <-- НОВАЯ ФУНКЦИЯ ПРОВЕРКИ СЕССИИ С ДЕТЕКТОРОМ КИКА -->
 async def is_user_client_authorized() -> bool:
     await ensure_user_client_connected()
     try:
@@ -427,17 +480,16 @@ async def auth_password(message: Message, state: FSMContext):
 
 async def finish_auth(message: Message):
     global session_alert_sent
-    session_alert_sent = False  # Сбрасываем флаг после переподключения
+    session_alert_sent = False
     me = await user_client.get_me()
     name = me.first_name or me.username or str(me.id)
     await message.answer(f"✅ Сессия добавлена!\n👤 Аккаунт: {name}\n\nЗагружаю модели...")
     await load_base_gifts()
     await message.answer(f"✅ Готово!\n📦 Моделей: {len(BASE_GIFTS)}\n\nНажми /start")
-    await start_monitor_if_needed()
 
 
 # ============================================================
-# ЗАГРУЗКА МОДЕЛЕЙ (БЕЗ ИЗМЕНЕНИЙ)
+# ЗАГРУЗКА МОДЕЛЕЙ
 # ============================================================
 
 async def load_base_gifts() -> List[BaseGift]:
@@ -483,7 +535,7 @@ async def ensure_models_loaded() -> None:
 
 
 # ============================================================
-# ПОИСК ПОДАРКОВ (БЕЗ ИЗМЕНЕНИЙ)
+# ПОИСК ПОДАРКОВ
 # ============================================================
 
 async def resolve_owner_info(raw_gift: Any) -> OwnerInfo:
@@ -604,82 +656,660 @@ async def find_market_gifts(
     return found
 
 
-async def get_full_market_state(gift_id: int, min_stars: int, max_stars: int, max_pages: int = 8) -> Tuple[List[MarketGift], Dict[str, int]]:
-    results = []
-    num_map = {}
-    offset = ""
-    pages = 0
-    while pages < max_pages:
-        pages += 1
-        result = await get_resale_page(gift_id=gift_id, offset=offset, limit=REQUEST_PAGE_LIMIT, sort_by_price=True)
-        raw_gifts = getattr(result, "gifts", []) or []
-        if not raw_gifts:
-            break
-        for raw in raw_gifts:
-            slug = get_field(raw, "slug")
-            if not slug:
-                continue
-            price = extract_stars_amount(get_field(raw, "resell_amount"))
-            if price < min_stars or price > max_stars:
-                continue
-            owner = await resolve_owner_info(raw)
-            if is_owner_blacklisted(owner):
-                continue
-            num = safe_int(get_field(raw, "num"))
-            num_map[slug] = num
-            results.append(MarketGift(
-                title=str(get_field(raw, "title") or "Gift"),
-                num=num,
-                slug=slug,
-                price=price,
-                owner=owner,
-            ))
-        offset = getattr(result, "next_offset", "") or ""
-        if not offset:
-            break
-    return results, num_map
-
-
 # ============================================================
-# ФОРМАТИРОВАНИЕ (БЕЗ MARKDOWN)
+# ПЕРСОНАЛЬНЫЙ МОНИТОРИНГ (ТОЛЬКО ПО КНОПКЕ)
 # ============================================================
 
-def format_gifts(gifts: List[MarketGift]) -> str:
-    lines = []
-    for i, gift in enumerate(gifts, 1):
-        num = f" #{gift.num}" if gift.num else ""
-        lines.append(
-            f"{i}. 🎁 {gift.title}{num}\n"
-            f"💰 Цена: {gift.price} ⭐\n"
-            f"👤 Владелец: {gift.owner.display}\n"
-            f"🔗 {gift.link}"
-        )
-    return "\n\n".join(lines)
-
-
-async def send_search_results(message: Message, base: BaseGift, results: List[MarketGift], min_price: int, max_price: int) -> None:
-    if not results:
-        await message.answer(f"❌ По модели {base.title} ничего не найдено в диапазоне {min_price}-{max_price} ⭐")
+async def perform_monitor_search(user_id: int) -> None:
+    """Поиск новых подарков для пользователя (только по вызову)"""
+    sess = USER_MONITOR_SESSIONS.get(user_id)
+    if not sess or not sess.active:
         return
     
-    text = f"🎁 {base.title}\n💰 Диапазон: {min_price}—{max_price} ⭐\n🔎 Найдено: {len(results)}\n\n"
+    await ensure_models_loaded()
     
-    for i, gift in enumerate(results[:10], 1):
+    # Определяем модели для сканирования
+    models_to_scan = sess.gift_ids if sess.gift_ids else [g.gift_id for g in BASE_GIFTS]
+    new_gifts = []
+    
+    for gift_id in models_to_scan:
+        if len(new_gifts) >= sess.limit:
+            break
+        
+        try:
+            result = await get_resale_page(
+                gift_id=gift_id,
+                offset="",
+                limit=sess.limit * 2,
+                sort_by_price=True
+            )
+            
+            for raw in getattr(result, "gifts", []) or []:
+                slug = get_field(raw, "slug")
+                if not slug:
+                    continue
+                
+                # Пропускаем уже виденные подарки
+                if slug in sess.seen_slugs:
+                    continue
+                
+                price = extract_stars_amount(get_field(raw, "resell_amount"))
+                if price < sess.min_price or price > sess.max_price:
+                    continue
+                
+                owner = await resolve_owner_info(raw)
+                if is_owner_blacklisted(owner):
+                    sess.seen_slugs.add(slug)
+                    continue
+                
+                gift = MarketGift(
+                    title=str(get_field(raw, "title") or "Gift"),
+                    num=safe_int(get_field(raw, "num")),
+                    slug=slug,
+                    price=price,
+                    owner=owner
+                )
+                
+                sess.seen_slugs.add(slug)
+                new_gifts.append(gift)
+                
+                if len(new_gifts) >= sess.limit:
+                    break
+        
+        except Exception as e:
+            log.error(f"Monitor search error for user {user_id}, model {gift_id}: {e}")
+        
+        await asyncio.sleep(0.5)
+    
+    # Сохраняем результаты
+    sess.last_results = new_gifts
+    save_user_monitor_sessions()
+    
+    # Отправляем результаты
+    if new_gifts:
+        await send_monitor_results(user_id, new_gifts)
+    else:
+        await send_no_results_message(user_id)
+
+
+async def send_monitor_results(user_id: int, gifts: List[MarketGift]) -> None:
+    """Отправка результатов мониторинга"""
+    if not gifts:
+        return
+    
+    sess = USER_MONITOR_SESSIONS.get(user_id)
+    if not sess:
+        return
+    
+    # Формируем сообщение
+    text = f"🎁 НОВЫЕ ПОДАРКИ НА МАРКЕТЕ\n"
+    text += f"💰 Диапазон: {sess.min_price}—{sess.max_price} ⭐\n"
+    text += f"🔎 Найдено: {len(gifts)}\n\n"
+    
+    for i, gift in enumerate(gifts[:10], 1):
         num = f" #{gift.num}" if gift.num else ""
-        text += f"{i}. {gift.title}{num}\n💰 {gift.price} ⭐ | 👤 {gift.owner.display}\n🔗 {gift.link}\n\n"
+        text += (
+            f"{i}. 🎁 {gift.title}{num}\n"
+            f"💰 {gift.price} ⭐\n"
+            f"👤 {gift.owner.display}\n"
+            f"🔗 {gift.link}\n\n"
+        )
     
     if len(text) > 4000:
         text = text[:3950] + "\n\n..."
     
-    await message.answer(
+    # Создаём клавиатуру
+    keyboard = await create_monitor_keyboard(user_id, gifts)
+    
+    # Отправляем или обновляем
+    try:
+        if sess.last_message_id:
+            await bot.edit_message_text(
+                text,
+                chat_id=user_id,
+                message_id=sess.last_message_id,
+                reply_markup=keyboard,
+                disable_web_page_preview=True
+            )
+        else:
+            msg = await bot.send_message(
+                user_id,
+                text,
+                reply_markup=keyboard,
+                disable_web_page_preview=True
+            )
+            sess.last_message_id = msg.message_id
+    except Exception as e:
+        log.warning(f"Failed to edit message for {user_id}: {e}")
+        msg = await bot.send_message(
+            user_id,
+            text,
+            reply_markup=keyboard,
+            disable_web_page_preview=True
+        )
+        sess.last_message_id = msg.message_id
+    
+    save_user_monitor_sessions()
+
+
+async def send_no_results_message(user_id: int) -> None:
+    """Отправка сообщения, что ничего не найдено"""
+    sess = USER_MONITOR_SESSIONS.get(user_id)
+    if not sess:
+        return
+    
+    text = (
+        f"🔍 НОВЫХ ПОДАРКОВ НЕ НАЙДЕНО\n\n"
+        f"📦 Модели: {'Все' if not sess.gift_ids else f'{len(sess.gift_ids)} моделей'}\n"
+        f"💰 Цена: {sess.min_price}—{sess.max_price} ⭐\n\n"
+        f"Нажмите 'ПОВТОРИТЬ ПОИСК' чтобы проверить снова."
+    )
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔁 ПОВТОРИТЬ ПОИСК", callback_data="monitor_repeat_search")],
+        [InlineKeyboardButton(text="📊 СТАТУС", callback_data="user_monitor_status")],
+        [InlineKeyboardButton(text="⏹ ОСТАНОВИТЬ", callback_data="user_monitor_stop")]
+    ])
+    
+    try:
+        if sess.last_message_id:
+            await bot.edit_message_text(
+                text,
+                chat_id=user_id,
+                message_id=sess.last_message_id,
+                reply_markup=keyboard
+            )
+        else:
+            msg = await bot.send_message(user_id, text, reply_markup=keyboard)
+            sess.last_message_id = msg.message_id
+    except Exception:
+        msg = await bot.send_message(user_id, text, reply_markup=keyboard)
+        sess.last_message_id = msg.message_id
+    
+    save_user_monitor_sessions()
+
+
+async def create_monitor_keyboard(user_id: int, gifts: List[MarketGift]) -> InlineKeyboardMarkup:
+    """Создаёт клавиатуру для мониторинга"""
+    rows = []
+    
+    # Кнопки бана для владельцев
+    for gift in gifts[:5]:
+        if gift.owner.key and gift.owner.key != "unknown":
+            rows.append([
+                InlineKeyboardButton(
+                    text=f"🚫 Забанить {gift.owner.display}",
+                    callback_data=f"monitor_ban_owner:{gift.owner.key}"
+                )
+            ])
+    
+    # Основные кнопки
+    rows.append([
+        InlineKeyboardButton(text="🔁 ПОВТОРИТЬ ПОИСК", callback_data="monitor_repeat_search")
+    ])
+    rows.append([
+        InlineKeyboardButton(text="🧹 СБРОСИТЬ ИСТОРИЮ", callback_data="monitor_clear_seen")
+    ])
+    rows.append([
+        InlineKeyboardButton(text="🚫 ЧЁРНЫЙ СПИСОК", callback_data="monitor_blacklist")
+    ])
+    
+    # Кнопки управления
+    rows.append([
+        InlineKeyboardButton(text="📊 СТАТУС", callback_data="user_monitor_status"),
+        InlineKeyboardButton(text="⏹ ОСТАНОВИТЬ", callback_data="user_monitor_stop")
+    ])
+    
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ============================================================
+# КНОПКИ МОНИТОРИНГА
+# ============================================================
+
+@dp.callback_query(F.data == "monitor_repeat_search")
+async def monitor_repeat_search(callback: CallbackQuery):
+    """ПОВТОРИТЬ ПОИСК - основная кнопка мониторинга"""
+    user_id = callback.from_user.id
+    sess = USER_MONITOR_SESSIONS.get(user_id)
+    
+    if not sess or not sess.active:
+        await callback.answer("⚠️ Мониторинг не активен", show_alert=True)
+        return
+    
+    await callback.answer("🔄 Ищу новые подарки...")
+    await perform_monitor_search(user_id)
+    await callback.answer("✅ Поиск выполнен")
+
+
+@dp.callback_query(F.data == "monitor_clear_seen")
+async def monitor_clear_seen(callback: CallbackQuery):
+    """Сброс истории (чтобы показать все подарки заново)"""
+    user_id = callback.from_user.id
+    sess = USER_MONITOR_SESSIONS.get(user_id)
+    
+    if not sess or not sess.active:
+        await callback.answer("❌ Мониторинг не запущен", show_alert=True)
+        return
+    
+    sess.seen_slugs = set()
+    save_user_monitor_sessions()
+    
+    await callback.answer("🧹 История сброшена")
+    await perform_monitor_search(user_id)
+
+
+@dp.callback_query(F.data == "monitor_blacklist")
+async def monitor_blacklist(callback: CallbackQuery):
+    """Показать чёрный список"""
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        await callback.answer("⛔ Только для админа", show_alert=True)
+        return
+    
+    if not OWNERS_BLACKLIST:
+        text = "🚫 Чёрный список пуст"
+    else:
+        lines = ["🚫 ЧЁРНЫЙ СПИСОК\n"]
+        for i, (key, label) in enumerate(list(OWNERS_BLACKLIST.items())[:50], 1):
+            lines.append(f"{i}. {key} — {label}")
+        text = "\n".join(lines)
+    
+    await callback.message.edit_text(
         text,
-        disable_web_page_preview=True,
-        reply_markup=search_results_keyboard(results)
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🧹 Очистить", callback_data="monitor_blacklist_clear")],
+            [InlineKeyboardButton(text="🔙 НАЗАД", callback_data="monitor_repeat_search")]
+        ])
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "monitor_blacklist_clear")
+async def monitor_blacklist_clear(callback: CallbackQuery):
+    """Очистить чёрный список"""
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        await callback.answer("⛔ Только для админа", show_alert=True)
+        return
+    
+    OWNERS_BLACKLIST.clear()
+    save_owner_blacklist()
+    await callback.answer("🧹 Чёрный список очищен")
+    await monitor_blacklist(callback)
+
+
+@dp.callback_query(F.data.startswith("monitor_ban_owner:"))
+async def monitor_ban_owner(callback: CallbackQuery):
+    """Бан владельца"""
+    user_id = callback.from_user.id
+    if not is_admin(user_id):
+        await callback.answer("⛔ Только для админа", show_alert=True)
+        return    
+    key = callback.data.split(":", 1)[1]
+    
+    if key in OWNERS_BLACKLIST:
+        await callback.answer("⚠️ Уже в чёрном списке")
+        return
+    
+    OWNERS_BLACKLIST[key] = f"Забанен через мониторинг пользователем {user_id}"
+    save_owner_blacklist()
+    
+    await callback.answer("✅ Владелец забанен")
+    
+    # Обновляем результаты
+    sess = USER_MONITOR_SESSIONS.get(user_id)
+    if sess and sess.last_results:
+        sess.last_results = [
+            g for g in sess.last_results 
+            if g.owner.key != key
+        ]
+        if sess.last_results:
+            await send_monitor_results(user_id, sess.last_results)
+        else:
+            await send_no_results_message(user_id)
+
+
+@dp.callback_query(F.data == "user_monitor_status")
+async def user_monitor_status(callback: CallbackQuery):
+    """Статус мониторинга"""
+    user_id = callback.from_user.id
+    sess = USER_MONITOR_SESSIONS.get(user_id)
+    
+    if not sess or not sess.active:
+        await callback.answer("📊 Мониторинг НЕ АКТИВЕН")
+        return
+    
+    model_names = []
+    if sess.gift_ids:
+        for gid in sess.gift_ids[:5]:
+            gift = BASE_GIFTS_BY_ID.get(gid)
+            if gift:
+                model_names.append(gift.title)
+        if len(sess.gift_ids) > 5:
+            model_names.append(f"... и ещё {len(sess.gift_ids) - 5}")
+    else:
+        model_names.append("Все модели")
+    
+    text = (
+        f"📊 СТАТУС МОНИТОРИНГА\n\n"
+        f"🟢 Активен: ДА\n"
+        f"📦 Модели: {', '.join(model_names)}\n"
+        f"💰 Диапазон: {sess.min_price}—{sess.max_price} ⭐\n"
+        f"🔢 Лимит: {sess.limit}\n"
+        f"📤 Найдено за сессию: {len(sess.seen_slugs)} шт.\n"
+        f"📋 Последних результатов: {len(sess.last_results)}\n\n"
+        f"Нажмите 'ПОВТОРИТЬ ПОИСК' чтобы обновить"
+    )
+    
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔁 ПОВТОРИТЬ ПОИСК", callback_data="monitor_repeat_search")],
+            [InlineKeyboardButton(text="🔙 НАЗАД", callback_data="monitor_repeat_search")]
+        ])
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "user_monitor_stop")
+async def user_monitor_stop(callback: CallbackQuery):
+    """Остановка мониторинга"""
+    user_id = callback.from_user.id
+    sess = USER_MONITOR_SESSIONS.get(user_id)
+    
+    if not sess or not sess.active:
+        await callback.answer("⚠️ Мониторинг уже остановлен")
+        return
+    
+    sess.active = False
+    sess.last_message_id = None
+    save_user_monitor_sessions()
+    
+    await callback.answer("✅ Мониторинг остановлен")
+    await callback.message.edit_text(
+        "⏹ МОНИТОРИНГ ОСТАНОВЛЕН\n\n"
+        "Чтобы запустить снова - используй /monitor",
+        reply_markup=main_menu_keyboard(user_id)
     )
 
 
 # ============================================================
-# КНОПКИ (ДОБАВЛЕНА КНОПКА ВЫДАЧИ ПРАВ)
+# ЗАПУСК МОНИТОРИНГА
+# ============================================================
+
+@dp.message(Command("monitor"))
+async def cmd_monitor(message: Message):
+    """Запуск мониторинга"""
+    user_id = message.from_user.id
+    if not is_user_allowed(user_id):
+        await message.answer("⛔ Доступ запрещён. Обратитесь к @rozuvu")
+        return
+    
+    if not await is_user_client_authorized():
+        await message.answer("⚠️ Сессия не активна. Обратитесь к админу")
+        return
+    
+    sess = USER_MONITOR_SESSIONS.get(user_id)
+    if sess and sess.active:
+        await message.answer("⚠️ Мониторинг уже запущен. Используй /status")
+        return
+    
+    if not sess:
+        sess = UserMonitorSession(user_id=user_id)
+        USER_MONITOR_SESSIONS[user_id] = sess
+    
+    await show_monitor_setup(message)
+
+
+async def show_monitor_setup(message: Message):
+    """Показывает настройки мониторинга"""
+    user_id = message.from_user.id
+    sess = USER_MONITOR_SESSIONS.get(user_id)
+    
+    if not sess:
+        return
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎯 ВЫБРАТЬ МОДЕЛЬ", callback_data="monitor_select_model")],
+        [InlineKeyboardButton(text="💰 УСТАНОВИТЬ ЦЕНУ", callback_data="monitor_set_price")],
+        [InlineKeyboardButton(text="🔢 УСТАНОВИТЬ ЛИМИТ", callback_data="monitor_set_limit")],
+        [InlineKeyboardButton(text="▶️ ЗАПУСТИТЬ МОНИТОРИНГ", callback_data="monitor_start_now")],
+        [InlineKeyboardButton(text="❌ ОТМЕНА", callback_data="menu")]
+    ])
+    
+    text = (
+        f"🎯 НАСТРОЙКА МОНИТОРИНГА\n\n"
+        f"Текущие настройки:\n"
+        f"📦 Модель: {'Все' if not sess.gift_ids else f'{len(sess.gift_ids)} моделей'}\n"
+        f"💰 Цена: {sess.min_price}—{sess.max_price} ⭐\n"
+        f"🔢 Лимит: {sess.limit} подарков\n\n"
+        f"После запуска нажмите 'ПОВТОРИТЬ ПОИСК' для обновления"
+    )
+    
+    await message.answer(text, reply_markup=keyboard)
+
+
+@dp.callback_query(F.data == "monitor_start_now")
+async def monitor_start_now(callback: CallbackQuery):
+    """Запуск мониторинга из настроек"""
+    user_id = callback.from_user.id
+    if not is_user_allowed(user_id):
+        await callback.answer("⛔ Доступ запрещён")
+        return
+    
+    sess = USER_MONITOR_SESSIONS.get(user_id)
+    if not sess:
+        sess = UserMonitorSession(user_id=user_id)
+        USER_MONITOR_SESSIONS[user_id] = sess
+    
+    if sess.active:
+        await callback.answer("⚠️ Уже запущен")
+        return
+    
+    sess.active = True
+    sess.seen_slugs = set()
+    save_user_monitor_sessions()
+    
+    await callback.answer("✅ Мониторинг запущен!")
+    
+    # Первый поиск
+    await perform_monitor_search(user_id)
+    
+    await callback.message.edit_text(
+        "🟢 МОНИТОРИНГ ЗАПУЩЕН\n\n"
+        f"📦 Модели: {'Все' if not sess.gift_ids else f'{len(sess.gift_ids)} моделей'}\n"
+        f"💰 Цена: {sess.min_price}—{sess.max_price} ⭐\n"
+        f"🔢 Лимит: {sess.limit} подарков\n\n"
+        f"Результаты будут показаны выше.\n"
+        f"Для обновления нажмите 'ПОВТОРИТЬ ПОИСК'",
+        reply_markup=main_menu_keyboard(user_id)
+    )
+
+
+@dp.callback_query(F.data == "monitor_select_model")
+async def monitor_select_model(callback: CallbackQuery):
+    """Выбор модели для мониторинга"""
+    user_id = callback.from_user.id
+    if not is_user_allowed(user_id):
+        await callback.answer("⛔ Доступ запрещён")
+        return
+    
+    await ensure_models_loaded()
+    
+    sess = USER_MONITOR_SESSIONS.get(user_id)
+    if not sess:
+        sess = UserMonitorSession(user_id=user_id)
+        USER_MONITOR_SESSIONS[user_id] = sess
+    
+    selected = set(sess.gift_ids)
+    keyboard = []
+    
+    # Показываем все модели
+    for gift in BASE_GIFTS[:20]:
+        check = "✅ " if gift.gift_id in selected else ""
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"{check}{gift.title[:30]}",
+                callback_data=f"monitor_toggle_model:{gift.gift_id}"
+            )
+        ])
+    
+    keyboard.append([
+        InlineKeyboardButton(text="✅ ВСЕ МОДЕЛИ", callback_data="monitor_select_all")
+    ])
+    keyboard.append([
+        InlineKeyboardButton(text="❌ ОЧИСТИТЬ ВСЕ", callback_data="monitor_clear_models")
+    ])
+    keyboard.append([
+        InlineKeyboardButton(text="🔙 НАЗАД", callback_data="monitor_back_setup")
+    ])
+    
+    await callback.message.edit_text(
+        "🎯 ВЫБЕРИ МОДЕЛИ ДЛЯ МОНИТОРИНГА\n\n"
+        "✅ - выбрана\n"
+        "Пусто - не выбрана\n\n"
+        "Если ничего не выбрано - будут все модели",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("monitor_toggle_model:"))
+async def monitor_toggle_model(callback: CallbackQuery):
+    """Переключение модели"""
+    user_id = callback.from_user.id
+    gift_id = int(callback.data.split(":")[1])
+    
+    sess = USER_MONITOR_SESSIONS.get(user_id)
+    if not sess:
+        sess = UserMonitorSession(user_id=user_id)
+        USER_MONITOR_SESSIONS[user_id] = sess
+    
+    if gift_id in sess.gift_ids:
+        sess.gift_ids.remove(gift_id)
+    else:
+        sess.gift_ids.append(gift_id)
+    
+    save_user_monitor_sessions()
+    await monitor_select_model(callback)
+
+
+@dp.callback_query(F.data == "monitor_select_all")
+async def monitor_select_all(callback: CallbackQuery):
+    """Выбрать все модели"""
+    user_id = callback.from_user.id
+    sess = USER_MONITOR_SESSIONS.get(user_id)
+    if not sess:
+        sess = UserMonitorSession(user_id=user_id)
+        USER_MONITOR_SESSIONS[user_id] = sess
+    
+    await ensure_models_loaded()
+    sess.gift_ids = [g.gift_id for g in BASE_GIFTS]
+    save_user_monitor_sessions()
+    await callback.answer("✅ Выбраны все модели")
+    await monitor_select_model(callback)
+
+
+@dp.callback_query(F.data == "monitor_clear_models")
+async def monitor_clear_models(callback: CallbackQuery):
+    """Очистить выбор моделей"""
+    user_id = callback.from_user.id
+    sess = USER_MONITOR_SESSIONS.get(user_id)
+    if sess:
+        sess.gift_ids = []
+        save_user_monitor_sessions()
+    await callback.answer("✅ Список моделей очищен")
+    await monitor_select_model(callback)
+
+
+@dp.callback_query(F.data == "monitor_set_price")
+async def monitor_set_price(callback: CallbackQuery):
+    """Установка ценового диапазона"""
+    await callback.message.answer(
+        "💰 ВВЕДИ ДИАПАЗОН ЦЕН\n\n"
+        "Отправь два числа через пробел:\n"
+        "Пример: 700 900\n\n"
+        "Для отмены отправь /cancel"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "monitor_set_limit")
+async def monitor_set_limit(callback: CallbackQuery):
+    """Установка лимита подарков"""
+    await callback.message.answer(
+        "🔢 УСТАНОВИ ЛИМИТ ПОДАРКОВ ЗА ЦИКЛ\n\n"
+        "Отправь число от 1 до 50:\n"
+        "Пример: 10\n\n"
+        "Для отмены отправь /cancel"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "monitor_back_setup")
+async def monitor_back_setup(callback: CallbackQuery):
+    """Возврат к настройкам"""
+    await show_monitor_setup(callback.message)
+    await callback.answer()
+
+
+@dp.message(lambda msg: msg.text and " " in msg.text and msg.text.split()[0].isdigit())
+async def handle_price_input(message: Message):
+    """Обработка ввода цены"""
+    user_id = message.from_user.id
+    if not is_user_allowed(user_id):
+        return
+    
+    parts = message.text.strip().split()
+    if len(parts) != 2:
+        await message.answer("❌ Отправь два числа: 500 800")
+        return
+    
+    try:
+        min_price = int(parts[0])
+        max_price = int(parts[1])
+        if min_price < 0 or max_price < 0 or min_price > max_price:
+            raise ValueError
+    except Exception:
+        await message.answer("❌ Введи корректные числа.")
+        return
+    
+    sess = USER_MONITOR_SESSIONS.get(user_id)
+    if not sess:
+        sess = UserMonitorSession(user_id=user_id)
+        USER_MONITOR_SESSIONS[user_id] = sess
+    
+    sess.min_price = min_price
+    sess.max_price = max_price
+    save_user_monitor_sessions()
+    
+    await message.answer(f"✅ Ценовой диапазон установлен: {min_price}—{max_price} ⭐")
+    await show_monitor_setup(message)
+
+
+@dp.message(lambda msg: msg.text and msg.text.isdigit() and 1 <= int(msg.text) <= 50)
+async def handle_limit_input(message: Message):
+    """Обработка ввода лимита"""
+    user_id = message.from_user.id
+    if not is_user_allowed(user_id):
+        return
+    
+    limit = int(message.text)
+    sess = USER_MONITOR_SESSIONS.get(user_id)
+    if not sess:
+        sess = UserMonitorSession(user_id=user_id)
+        USER_MONITOR_SESSIONS[user_id] = sess
+    
+    sess.limit = limit
+    save_user_monitor_sessions()
+    
+    await message.answer(f"✅ Лимит установлен: {limit} подарков")
+    await show_monitor_setup(message)
+
+
+# ============================================================
+# ОСНОВНЫЕ ХЕНДЛЕРЫ
 # ============================================================
 
 def main_menu_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
@@ -688,7 +1318,6 @@ def main_menu_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="📡 МОНИТОРИНГ", callback_data="monitor_panel")])
         rows.append([InlineKeyboardButton(text="⚙️ АДМИН-ПАНЕЛЬ", callback_data="admin_panel")])
         rows.append([InlineKeyboardButton(text="🔄 ОБНОВИТЬ МОДЕЛИ", callback_data="reload_models")])
-        # <-- НОВАЯ КНОПКА ДЛЯ ВЫДАЧИ ПРАВ -->
         rows.append([InlineKeyboardButton(text="👥 ВЫДАТЬ ДОСТУП", callback_data="grant_access_panel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -728,29 +1357,16 @@ def search_results_keyboard(results: List[MarketGift]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def monitor_keyboard() -> InlineKeyboardMarkup:
-    status = "🟢 РАБОТАЕТ" if monitor_running else "🔴 ОСТАНОВЛЕН"
-    rows = [[InlineKeyboardButton(text=f"📊 СТАТУС: {status}", callback_data="monitor_status")]]
-    if monitor_running:
-        rows.append([InlineKeyboardButton(text="⏹ ОСТАНОВИТЬ", callback_data="monitor_stop")])
-    else:
-        rows.append([InlineKeyboardButton(text="▶️ ЗАПУСТИТЬ", callback_data="monitor_start")])
-    rows.append([InlineKeyboardButton(text="🧹 СБРОСИТЬ ИСТОРИЮ МОНИТОРА", callback_data="monitor_reset")])
-    rows.append([InlineKeyboardButton(text="🏠 ГЛАВНОЕ", callback_data="menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
 def admin_panel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔐 ПРОВЕРИТЬ СЕССИЮ", callback_data="check_session_admin")],
         [InlineKeyboardButton(text="➕ ДОБАВИТЬ СЕССИЮ", callback_data="add_session_btn")],
         [InlineKeyboardButton(text="📊 СТАТУС БОТА", callback_data="bot_status")],
-        [InlineKeyboardButton(text="👥 ВЫДАТЬ ДОСТУП", callback_data="grant_access_panel")],  # <-- ДОБАВЛЕНО
+        [InlineKeyboardButton(text="👥 ВЫДАТЬ ДОСТУП", callback_data="grant_access_panel")],
         [InlineKeyboardButton(text="🏠 ГЛАВНОЕ", callback_data="menu")]
     ])
 
 
-# <-- НОВАЯ КЛАВИАТУРА ДЛЯ ВЫДАЧИ ПРАВ -->
 def grant_access_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ ВЫДАТЬ ПО ID", callback_data="grant_access")],
@@ -760,376 +1376,20 @@ def grant_access_keyboard() -> InlineKeyboardMarkup:
 
 
 # ============================================================
-# АДМИН-ПАНЕЛЬ (ДОБАВЛЕНА ИНФОРМАЦИЯ О WHITELIST)
-# ============================================================
-
-@dp.callback_query(F.data == "admin_panel")
-async def admin_panel(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Только для админа")
-        return
-    is_auth = await is_user_client_authorized()
-    status = "✅ АКТИВНА" if is_auth else "❌ НЕ АКТИВНА"
-    me = await user_client.get_me() if is_auth else None
-    account = f"{me.first_name} (@{me.username})" if me else "—"
-    await callback.message.edit_text(
-        f"⚙️ АДМИН-ПАНЕЛЬ\n\n"
-        f"🔐 Сессия: {status}\n"
-        f"👤 Аккаунт: {account}\n"
-        f"📦 Моделей: {len(BASE_GIFTS)}\n"
-        f"📡 Мониторинг: {'🟢 ВКЛ' if monitor_running else '🔴 ВЫКЛ'}\n"
-        f"🚫 В черном списке: {len(OWNERS_BLACKLIST)}\n"
-        f"📤 Запомнено slug: {len(SENT_MONITOR_SLUGS)}\n"
-        f"👥 Разрешённых юзеров: {len(WHITELIST_USERS)}",  # <-- ДОБАВЛЕНО
-        reply_markup=admin_panel_keyboard()
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "check_session_admin")
-async def check_session_admin(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Только для админа")
-        return
-
-    is_auth = await is_user_client_authorized()
-    
-    if is_auth:
-        try:
-            me = await user_client.get_me()
-            if me:
-                name = me.first_name or "Пользователь"
-                username = f" (@{me.username})" if me.username else ""
-                await callback.answer(
-                    f"✅ Сессия активна\n👤 {name}{username}",
-                    show_alert=True
-                )
-            else:
-                await callback.answer("✅ Сессия активна", show_alert=True)
-        except Exception as e:
-            await callback.answer(f"⚠️ Сессия активна, но ошибка: {e}", show_alert=True)
-    else:
-        await callback.answer("❌ Сессия не активна!\nИспользуй /add_session", show_alert=True)
-
-    await admin_panel(callback)
-
-
-@dp.callback_query(F.data == "add_session_btn")
-async def add_session_btn(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Только для админа")
-        return
-    await callback.message.answer(
-        "📱 ДОБАВЛЕНИЕ СЕССИИ\n\n"
-        "Введите номер телефона:\n"
-        "Пример: +79991234567\n\n"
-        "❌ Отмена — /cancel"
-    )
-    await state.set_state(AuthState.waiting_phone)
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "bot_status")
-async def bot_status_callback(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Только для админа")
-        return
-    is_auth = await is_user_client_authorized()
-    me = await user_client.get_me() if is_auth else None
-    text = (
-        f"📊 СТАТУС БОТА\n\n"
-        f"🤖 Бот: @{bot.username}\n"
-        f"🔐 Сессия: {'✅ АКТИВНА' if is_auth else '❌ НЕ АКТИВНА'}\n"
-    )
-    if me:
-        text += f"👤 Аккаунт: {me.first_name} (@{me.username})\n"
-    text += (
-        f"📦 Моделей: {len(BASE_GIFTS)}\n"
-        f"📡 Мониторинг: {'🟢 ВКЛ' if monitor_running else '🔴 ВЫКЛ'}\n"
-        f"🚫 В черном списке: {len(OWNERS_BLACKLIST)}\n"
-        f"📤 Запомнено slug: {len(SENT_MONITOR_SLUGS)}\n"
-        f"👥 Разрешённых юзеров: {len(WHITELIST_USERS)}"
-    )
-    await callback.message.edit_text(text)
-    await callback.answer()
-
-
-# ============================================================
-# ВЫДАЧА ПРАВ (НОВЫЙ БЛОК)
-# ============================================================
-
-@dp.callback_query(F.data == "grant_access_panel")
-async def grant_access_panel(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Только для админа")
-        return
-    await callback.message.edit_text(
-        "👥 УПРАВЛЕНИЕ ДОСТУПОМ\n\n"
-        "Здесь вы можете выдать доступ к функциям бота обычным пользователям.\n"
-        "Для выдачи отправьте команду:\n"
-        "/grant ID_пользователя\n\n"
-        "Например: /grant 123456789\n\n"
-        "Пользователь сможет:\n"
-        "- Искать подарки по моделям\n"
-        "- Получать уведомления мониторинга (если они включены в группу)\n\n"
-        "⚠️ Только для администратора.",
-        reply_markup=grant_access_keyboard()
-    )
-    await callback.answer()
-
-
-@dp.message(Command("grant"))
-async def grant_access_command(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("⛔ Только для администратора")
-        return
-    parts = message.text.split()
-    if len(parts) != 2:
-        await message.answer("❌ Использование: /grant ID_пользователя")
-        return
-    try:
-        user_id = int(parts[1])
-    except ValueError:
-        await message.answer("❌ ID должен быть числом")
-        return
-    WHITELIST_USERS.add(user_id)
-    save_whitelist()
-    await message.answer(f"✅ Пользователь {user_id} добавлен в список разрешённых.")
-
-
-@dp.message(Command("revoke"))
-async def revoke_access_command(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("⛔ Только для администратора")
-        return
-    parts = message.text.split()
-    if len(parts) != 2:
-        await message.answer("❌ Использование: /revoke ID_пользователя")
-        return
-    try:
-        user_id = int(parts[1])
-    except ValueError:
-        await message.answer("❌ ID должен быть числом")
-        return
-    if user_id in WHITELIST_USERS:
-        WHITELIST_USERS.remove(user_id)
-        save_whitelist()
-        await message.answer(f"✅ Доступ отозван у {user_id}")
-    else:
-        await message.answer(f"❌ Пользователь {user_id} не в списке разрешённых.")
-
-
-@dp.callback_query(F.data == "grant_access")
-async def grant_access_callback(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Только для админа")
-        return
-    await callback.message.answer(
-        "Введите ID пользователя для выдачи доступа:\n"
-        "Пример: 123456789"
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "list_allowed")
-async def list_allowed_callback(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Только для админа")
-        return
-    if not WHITELIST_USERS:
-        text = "👥 Список разрешённых пуст."
-    else:
-        text = "👥 РАЗРЕШЁННЫЕ ПОЛЬЗОВАТЕЛИ:\n\n"
-        for uid in sorted(WHITELIST_USERS):
-            try:
-                user = await bot.get_chat(uid)
-                name = user.full_name or user.username or str(uid)
-                text += f"• {name} (ID: {uid})\n"
-            except Exception:
-                text += f"• ID: {uid}\n"
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 НАЗАД", callback_data="grant_access_panel")]
-    ]))
-    await callback.answer()
-
-
-# ============================================================
-# МОНИТОРИНГ (ДОБАВЛЕНА ПРОВЕРКА СЕССИИ + ОПОВЕЩЕНИЕ АДМИНУ)
-# ============================================================
-
-async def warmup_monitor_seen() -> None:
-    global SENT_MONITOR_SLUGS
-    if SENT_MONITOR_SLUGS:
-        log.info("Monitor warmup skipped: already have %s slugs", len(SENT_MONITOR_SLUGS))
-        return
-    log.info("Monitor warmup started...")
-    count = 0
-    for base in BASE_GIFTS[:MONITOR_MODELS_LIMIT]:
-        result = await get_resale_page(gift_id=base.gift_id, offset="", limit=MONITOR_PER_MODEL_LIMIT, sort_by_price=True)
-        for raw in getattr(result, "gifts", []) or []:
-            slug = get_field(raw, "slug")
-            if slug:
-                SENT_MONITOR_SLUGS.add(str(slug))
-                count += 1
-        await asyncio.sleep(random.uniform(0.6, 1.5))
-    save_monitor_seen()
-    log.info("Monitor warmup complete. Saved %s slugs", count)
-
-
-async def collect_new_monitor_gifts() -> List[MarketGift]:
-    new_gifts: List[MarketGift] = []
-    for base in BASE_GIFTS[:MONITOR_MODELS_LIMIT]:
-        if len(new_gifts) >= MONITOR_SEND_LIMIT:
-            break
-        result = await get_resale_page(gift_id=base.gift_id, offset="", limit=MONITOR_PER_MODEL_LIMIT, sort_by_price=True)
-        for raw in getattr(result, "gifts", []) or []:
-            slug = get_field(raw, "slug")
-            if not slug or slug in SENT_MONITOR_SLUGS:
-                continue
-            owner = await resolve_owner_info(raw)
-            if is_owner_blacklisted(owner):
-                SENT_MONITOR_SLUGS.add(str(slug))
-                log.info("Monitor skip blacklisted owner %s for %s", owner.display, slug)
-                continue
-            gift = MarketGift(
-                title=str(get_field(raw, "title") or base.title),
-                num=safe_int(get_field(raw, "num")),
-                slug=str(slug),
-                price=extract_stars_amount(get_field(raw, "resell_amount")),
-                owner=owner,
-            )
-            SENT_MONITOR_SLUGS.add(str(slug))
-            new_gifts.append(gift)
-            if len(new_gifts) >= MONITOR_SEND_LIMIT:
-                break
-        await asyncio.sleep(random.uniform(0.7, 1.8))
-    if new_gifts:
-        save_monitor_seen()
-    return new_gifts
-
-
-async def send_monitor_gifts(gifts: List[MarketGift]) -> None:
-    if not gifts or not MONITOR_CHAT_ID:
-        return
-    try:
-        await bot.get_chat(MONITOR_CHAT_ID)
-    except Exception as e:
-        log.error(f"Monitor chat {MONITOR_CHAT_ID} not found: {e}")
-        return
-    for gift in gifts:
-        num_text = f" #{gift.num}" if gift.num else ""
-        msg = (
-            f"🆕 НОВЫЙ ПОДАРОК НА ПРОДАЖЕ\n"
-            f"━━━━━━━━━━━━━━━━━\n"
-            f"🎁 {gift.title}{num_text}\n"
-            f"💰 Цена: {gift.price} ⭐\n"
-            f"👤 Владелец: {gift.owner.display}\n"
-            f"🔗 {gift.link}\n"
-            f"━━━━━━━━━━━━━━━━━\n"
-            f"⏱ {datetime.now().strftime('%H:%M:%S')}"
-        )
-        try:
-            await bot.send_message(MONITOR_CHAT_ID, msg, disable_web_page_preview=True)
-            log.info(f"Monitor sent: {gift.slug}")
-            await asyncio.sleep(1.5)
-        except Exception as e:
-            log.error(f"Monitor send error for {gift.slug}: {e}")
-
-
-async def check_session_and_alert() -> bool:
-    global session_alert_sent
-    is_auth = await is_user_client_authorized()
-    if not is_auth and not session_alert_sent:
-        session_alert_sent = True
-        try:
-            await bot.send_message(
-                ADMIN_ID,
-                "🚨 **СРОЧНО: СЕССИЯ ТЕЛЕГРАМ ПОТЕРЯНА!**\n\n"
-                "Аккаунт разлогинился или сессия кикнута.\n"
-                "Бот не может выполнять парсинг и мониторинг.\n"
-                "Восстановите сессию командой /add_session.",
-                parse_mode="Markdown"
-            )
-            log.warning("Session loss alert sent to admin")
-        except Exception as e:
-            log.error("Failed to send session alert: %s", e)
-        return False
-    elif is_auth and session_alert_sent:
-        session_alert_sent = False
-        log.info("Session restored, alert flag cleared")
-        try:
-            await bot.send_message(
-                ADMIN_ID,
-                "✅ **СЕССИЯ ВОССТАНОВЛЕНА**\n\n"
-                "Бот снова работает в штатном режиме.",
-                parse_mode="Markdown"
-            )
-        except Exception:
-            pass
-    return is_auth
-
-
-async def monitor_worker() -> None:
-    global monitor_running
-    log.info("Monitor worker started")
-    while monitor_running:
-        try:
-            # <-- ПРОВЕРЯЕМ СЕССИЮ ПЕРЕД КАЖДЫМ ЦИКЛОМ -->
-            if not await check_session_and_alert():
-                log.warning("Monitor paused: session invalid")
-                await asyncio.sleep(30)
-                continue
-
-            if not await is_user_client_authorized():
-                await asyncio.sleep(30)
-                continue
-
-            await ensure_models_loaded()
-            new_gifts = await collect_new_monitor_gifts()
-            if new_gifts:
-                log.info("Monitor found %s new gifts", len(new_gifts))
-                await send_monitor_gifts(new_gifts)
-        except FloodWaitError as e:
-            wait_time = int(e.seconds) + 1
-            log.warning("Monitor FloodWait: %s sec", wait_time)
-            await asyncio.sleep(wait_time)
-        except Exception as e:
-            log.error("Monitor error: %s", e)
-            await asyncio.sleep(10)
-        await asyncio.sleep(MONITOR_INTERVAL)
-    log.info("Monitor worker stopped")
-
-
-async def start_monitor_if_needed() -> None:
-    global monitor_running, monitor_task
-    if not MONITOR_CHAT_ID:
-        return
-    if monitor_running or not await is_user_client_authorized():
-        return
-    await ensure_models_loaded()
-    if MONITOR_WARMUP_ON_START:
-        await warmup_monitor_seen()
-    monitor_running = True
-    monitor_task = asyncio.create_task(monitor_worker())
-    log.info("Monitor auto-started")
-
-
-# ============================================================
-# ОСНОВНЫЕ ХЕНДЛЕРЫ (ДОБАВЛЕНА ПРОВЕРКА is_user_allowed)
+# ОСНОВНЫЕ ХЕНДЛЕРЫ
 # ============================================================
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     user_id = message.from_user.id
-
-    # <-- ПРОВЕРКА ДОСТУПА -->
+    
     if not is_user_allowed(user_id):
         await message.answer(
             "⛔ У вас нет доступа к этому боту.\n\n"
             "Для получения доступа обратитесь к администратору: @rozuvu"
         )
         return
-
+    
     if not await is_user_client_authorized():
         if is_admin(user_id):
             await message.answer(
@@ -1146,10 +1406,64 @@ async def cmd_start(message: Message):
     await message.answer(
         "🎁 ПАРСЕР ПОДАРКОВ\n\n"
         "📦 Выбери модель и введи диапазон цены.\n"
-        "📡 Мониторинг сам отправляет новые подарки в группу.\n\n"
+        "📡 Мониторинг работает по кнопке 'ПОВТОРИТЬ ПОИСК'.\n\n"
         "Пример цены: 500 800",
         reply_markup=main_menu_keyboard(user_id)
     )
+
+
+@dp.message(Command("status"))
+async def cmd_status(message: Message):
+    user_id = message.from_user.id
+    if not is_user_allowed(user_id):
+        await message.answer("⛔ Доступ запрещён")
+        return
+    
+    sess = USER_MONITOR_SESSIONS.get(user_id)
+    if not sess or not sess.active:
+        await message.answer("📊 Мониторинг НЕ АКТИВЕН")
+        return
+    
+    model_names = []
+    if sess.gift_ids:
+        for gid in sess.gift_ids[:5]:
+            gift = BASE_GIFTS_BY_ID.get(gid)
+            if gift:
+                model_names.append(gift.title)
+        if len(sess.gift_ids) > 5:
+            model_names.append(f"... и ещё {len(sess.gift_ids) - 5}")
+    else:
+        model_names.append("Все модели")
+    
+    text = (
+        f"📊 СТАТУС МОНИТОРИНГА\n\n"
+        f"🟢 Активен: ДА\n"
+        f"📦 Модели: {', '.join(model_names)}\n"
+        f"💰 Диапазон: {sess.min_price}—{sess.max_price} ⭐\n"
+        f"🔢 Лимит: {sess.limit}\n"
+        f"📤 Найдено за сессию: {len(sess.seen_slugs)} шт.\n"
+        f"📋 Последних результатов: {len(sess.last_results)}"
+    )
+    
+    await message.answer(text)
+
+
+@dp.message(Command("stop_monitor"))
+async def cmd_stop_monitor(message: Message):
+    user_id = message.from_user.id
+    if not is_user_allowed(user_id):
+        await message.answer("⛔ Доступ запрещён")
+        return
+    
+    sess = USER_MONITOR_SESSIONS.get(user_id)
+    if not sess or not sess.active:
+        await message.answer("⚠️ Мониторинг не запущен")
+        return
+    
+    sess.active = False
+    sess.last_message_id = None
+    save_user_monitor_sessions()
+    await message.answer("✅ Мониторинг остановлен")
 
 
 @dp.callback_query(F.data == "menu")
@@ -1250,6 +1564,27 @@ async def price_handler(message: Message):
     await send_search_results(message, base, results, min_price, max_price)
 
 
+async def send_search_results(message: Message, base: BaseGift, results: List[MarketGift], min_price: int, max_price: int) -> None:
+    if not results:
+        await message.answer(f"❌ По модели {base.title} ничего не найдено в диапазоне {min_price}-{max_price} ⭐")
+        return
+    
+    text = f"🎁 {base.title}\n💰 Диапазон: {min_price}—{max_price} ⭐\n🔎 Найдено: {len(results)}\n\n"
+    
+    for i, gift in enumerate(results[:10], 1):
+        num = f" #{gift.num}" if gift.num else ""
+        text += f"{i}. {gift.title}{num}\n💰 {gift.price} ⭐ | 👤 {gift.owner.display}\n🔗 {gift.link}\n\n"
+    
+    if len(text) > 4000:
+        text = text[:3950] + "\n\n..."
+    
+    await message.answer(
+        text,
+        disable_web_page_preview=True,
+        reply_markup=search_results_keyboard(results)
+    )
+
+
 @dp.callback_query(F.data == "repeat_search")
 async def repeat_search(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -1346,68 +1681,192 @@ async def clear_blacklist(callback: CallbackQuery):
     await show_blacklist(callback)
 
 
-@dp.callback_query(F.data == "monitor_panel")
-async def monitor_panel(callback: CallbackQuery):
+# ============================================================
+# АДМИН-ПАНЕЛЬ
+# ============================================================
+
+@dp.callback_query(F.data == "admin_panel")
+async def admin_panel(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
-        await callback.answer("Только для админа")
+        await callback.answer("⛔ Только для админа")
         return
-    text = (
-        f"📡 МОНИТОРИНГ\n\n"
-        f"Статус: {'🟢 работает' if monitor_running else '🔴 остановлен'}\n"
-        f"Группа: {MONITOR_CHAT_ID}\n"
-        f"Интервал: {MONITOR_INTERVAL} сек\n"
-        f"Моделей за цикл: {MONITOR_MODELS_LIMIT}\n"
-        f"Запомнено slug: {len(SENT_MONITOR_SLUGS)}"
+    is_auth = await is_user_client_authorized()
+    status = "✅ АКТИВНА" if is_auth else "❌ НЕ АКТИВНА"
+    me = await user_client.get_me() if is_auth else None
+    account = f"{me.first_name} (@{me.username})" if me else "—"
+    active_monitors = sum(1 for s in USER_MONITOR_SESSIONS.values() if s.active)
+    await callback.message.edit_text(
+        f"⚙️ АДМИН-ПАНЕЛЬ\n\n"
+        f"🔐 Сессия: {status}\n"
+        f"👤 Аккаунт: {account}\n"
+        f"📦 Моделей: {len(BASE_GIFTS)}\n"
+        f"👥 Активных мониторингов: {active_monitors}\n"
+        f"🚫 В черном списке: {len(OWNERS_BLACKLIST)}\n"
+        f"👥 Разрешённых юзеров: {len(WHITELIST_USERS)}",
+        reply_markup=admin_panel_keyboard()
     )
-    await callback.message.edit_text(text, reply_markup=monitor_keyboard())
     await callback.answer()
 
 
-@dp.callback_query(F.data == "monitor_start")
-async def monitor_start(callback: CallbackQuery):
-    global monitor_running, monitor_task
+@dp.callback_query(F.data == "check_session_admin")
+async def check_session_admin(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
-        await callback.answer("Только для админа")
+        await callback.answer("⛔ Только для админа")
         return
-    if monitor_running:
-        await callback.answer("Уже работает")
-        return
-    if not await is_user_client_authorized():
-        await callback.answer("Сессия не авторизована", show_alert=True)
-        return
-    await ensure_models_loaded()
-    monitor_running = True
-    monitor_task = asyncio.create_task(monitor_worker())
-    await callback.answer("Мониторинг запущен")
-    await monitor_panel(callback)
+    is_auth = await is_user_client_authorized()
+    if is_auth:
+        try:
+            me = await user_client.get_me()
+            if me:
+                name = me.first_name or "Пользователь"
+                username = f" (@{me.username})" if me.username else ""
+                await callback.answer(f"✅ Сессия активна\n👤 {name}{username}", show_alert=True)
+            else:
+                await callback.answer("✅ Сессия активна", show_alert=True)
+        except Exception as e:
+            await callback.answer(f"⚠️ Сессия активна, но ошибка: {e}", show_alert=True)
+    else:
+        await callback.answer("❌ Сессия не активна!\nИспользуй /add_session", show_alert=True)
+    await admin_panel(callback)
 
 
-@dp.callback_query(F.data == "monitor_stop")
-async def monitor_stop(callback: CallbackQuery):
-    global monitor_running
+@dp.callback_query(F.data == "add_session_btn")
+async def add_session_btn(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
-        await callback.answer("Только для админа")
+        await callback.answer("⛔ Только для админа")
         return
-    monitor_running = False
-    await callback.answer("Мониторинг остановлен")
-    await monitor_panel(callback)
+    await callback.message.answer(
+        "📱 ДОБАВЛЕНИЕ СЕССИИ\n\n"
+        "Введите номер телефона:\n"
+        "Пример: +79991234567\n\n"
+        "❌ Отмена — /cancel"
+    )
+    await state.set_state(AuthState.waiting_phone)
+    await callback.answer()
 
 
-@dp.callback_query(F.data == "monitor_status")
-async def monitor_status(callback: CallbackQuery):
-    await callback.answer("Работает" if monitor_running else "Остановлен")
-
-
-@dp.callback_query(F.data == "monitor_reset")
-async def monitor_reset(callback: CallbackQuery):
-    global SENT_MONITOR_SLUGS
+@dp.callback_query(F.data == "bot_status")
+async def bot_status_callback(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
-        await callback.answer("Только для админа")
+        await callback.answer("⛔ Только для админа")
         return
-    SENT_MONITOR_SLUGS = set()
-    save_monitor_seen()
-    await callback.answer("История мониторинга очищена")
-    await monitor_panel(callback)
+    is_auth = await is_user_client_authorized()
+    me = await user_client.get_me() if is_auth else None
+    active_monitors = sum(1 for s in USER_MONITOR_SESSIONS.values() if s.active)
+    text = (
+        f"📊 СТАТУС БОТА\n\n"
+        f"🤖 Бот: @{bot.username}\n"
+        f"🔐 Сессия: {'✅ АКТИВНА' if is_auth else '❌ НЕ АКТИВНА'}\n"
+    )
+    if me:
+        text += f"👤 Аккаунт: {me.first_name} (@{me.username})\n"
+    text += (
+        f"📦 Моделей: {len(BASE_GIFTS)}\n"
+        f"👥 Активных мониторингов: {active_monitors}\n"
+        f"🚫 В черном списке: {len(OWNERS_BLACKLIST)}\n"
+        f"👥 Разрешённых юзеров: {len(WHITELIST_USERS)}"
+    )
+    await callback.message.edit_text(text)
+    await callback.answer()
+
+
+# ============================================================
+# ВЫДАЧА ПРАВ
+# ============================================================
+
+@dp.callback_query(F.data == "grant_access_panel")
+async def grant_access_panel(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Только для админа")
+        return
+    await callback.message.edit_text(
+        "👥 УПРАВЛЕНИЕ ДОСТУПОМ\n\n"
+        "Здесь вы можете выдать доступ к функциям бота обычным пользователям.\n"
+        "Для выдачи отправьте команду:\n"
+        "/grant ID_пользователя\n\n"
+        "Например: /grant 123456789\n\n"
+        "Пользователь сможет:\n"
+        "- Искать подарки по моделям\n"
+        "- Использовать мониторинг\n\n"
+        "⚠️ Только для администратора.",
+        reply_markup=grant_access_keyboard()
+    )
+    await callback.answer()
+
+
+@dp.message(Command("grant"))
+async def grant_access_command(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Только для администратора")
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("❌ Использование: /grant ID_пользователя")
+        return
+    try:
+        user_id = int(parts[1])
+    except ValueError:
+        await message.answer("❌ ID должен быть числом")
+        return
+    WHITELIST_USERS.add(user_id)
+    save_whitelist()
+    await message.answer(f"✅ Пользователь {user_id} добавлен в список разрешённых.")
+
+
+@dp.message(Command("revoke"))
+async def revoke_access_command(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Только для администратора")
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("❌ Использование: /revoke ID_пользователя")
+        return
+    try:
+        user_id = int(parts[1])
+    except ValueError:
+        await message.answer("❌ ID должен быть числом")
+        return
+    if user_id in WHITELIST_USERS:
+        WHITELIST_USERS.remove(user_id)
+        save_whitelist()
+        await message.answer(f"✅ Доступ отозван у {user_id}")
+    else:
+        await message.answer(f"❌ Пользователь {user_id} не в списке разрешённых.")
+
+
+@dp.callback_query(F.data == "grant_access")
+async def grant_access_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Только для админа")
+        return
+    await callback.message.answer(
+        "Введите ID пользователя для выдачи доступа:\n"
+        "Пример: 123456789"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "list_allowed")
+async def list_allowed_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Только для админа")
+        return
+    if not WHITELIST_USERS:
+        text = "👥 Список разрешённых пуст."
+    else:
+        text = "👥 РАЗРЕШЁННЫЕ ПОЛЬЗОВАТЕЛИ:\n\n"
+        for uid in sorted(WHITELIST_USERS):
+            try:
+                user = await bot.get_chat(uid)
+                name = user.full_name or user.username or str(uid)
+                text += f"• {name} (ID: {uid})\n"
+            except Exception:
+                text += f"• ID: {uid}\n"
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 НАЗАД", callback_data="grant_access_panel")]
+    ]))
+    await callback.answer()
 
 
 @dp.message(Command("cancel"))
@@ -1423,19 +1882,20 @@ async def cancel_command(message: Message, state: FSMContext):
 
 async def main():
     global SEEN_GIFTS_BY_QUERY, SENT_MONITOR_SLUGS, OWNERS_BLACKLIST, OWNER_CACHE
-    global monitor_running, monitor_task, market_snapshots, WHITELIST_USERS, session_alert_sent
+    global WHITELIST_USERS, USER_MONITOR_SESSIONS, session_alert_sent
 
     SEEN_GIFTS_BY_QUERY = load_seen_manual()
     SENT_MONITOR_SLUGS = load_monitor_seen()
     OWNERS_BLACKLIST = load_owner_blacklist()
     OWNER_CACHE = load_owner_cache()
-    WHITELIST_USERS = load_whitelist()  # <-- ЗАГРУЖАЕМ WHITELIST
+    WHITELIST_USERS = load_whitelist()
+    USER_MONITOR_SESSIONS = load_user_monitor_sessions()
     market_snapshots = load_json("market_state.json", {})
 
     log.info(
-        "Loaded storage: manual_queries=%s | monitor_slugs=%s | blacklist=%s | owner_cache=%s | whitelist=%s",
+        "Loaded storage: manual_queries=%s | monitor_slugs=%s | blacklist=%s | owner_cache=%s | whitelist=%s | monitor_sessions=%s",
         len(SEEN_GIFTS_BY_QUERY), len(SENT_MONITOR_SLUGS), len(OWNERS_BLACKLIST),
-        len(OWNER_CACHE), len(WHITELIST_USERS)
+        len(OWNER_CACHE), len(WHITELIST_USERS), len(USER_MONITOR_SESSIONS)
     )
 
     await ensure_user_client_connected()
@@ -1448,12 +1908,8 @@ async def main():
             log.info("Models loaded: %s", len(BASE_GIFTS))
         except Exception as e:
             log.error("Models load error: %s", e)
-        try:
-            await start_monitor_if_needed()
-        except Exception as e:
-            log.error("Monitor autostart error: %s", e)
     else:
-        session_alert_sent = True  # Устанавливаем флаг, чтобы оповестить админа при старте
+        session_alert_sent = True
         log.info("Telethon not authorized. Admin must run /add_session")
         try:
             await bot.send_message(
