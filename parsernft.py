@@ -623,7 +623,6 @@ def models_keyboard(page: int = 0, mode: str = "parse") -> InlineKeyboardMarkup:
 
 def search_results_keyboard(results: List[MarketGift], mode: str = "parse") -> InlineKeyboardMarkup:
     rows = []
-    # Кнопки бана для каждого владельца (могут ВСЕ)
     for i, gift in enumerate(results[:10]):
         if gift.owner.key and gift.owner.key != "unknown":
             rows.append([InlineKeyboardButton(
@@ -667,7 +666,6 @@ def grant_access_keyboard() -> InlineKeyboardMarkup:
 
 @dp.callback_query(F.data == "mode_parse")
 async def mode_parse(callback: CallbackQuery):
-    """Режим обычного парсинга"""
     user_id = callback.from_user.id
     if not is_user_allowed(user_id):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
@@ -683,7 +681,6 @@ async def mode_parse(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "mode_new")
 async def mode_new(callback: CallbackQuery):
-    """Режим новых подарков"""
     user_id = callback.from_user.id
     if not is_user_allowed(user_id):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
@@ -728,7 +725,6 @@ async def models_new_page(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("gift_parse:"))
 async def gift_parse(callback: CallbackQuery):
-    """Выбор модели для обычного парсинга"""
     user_id = callback.from_user.id
     if not is_user_allowed(user_id):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
@@ -751,7 +747,6 @@ async def gift_parse(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("gift_new:"))
 async def gift_new(callback: CallbackQuery):
-    """Выбор модели для новых подарков"""
     user_id = callback.from_user.id
     if not is_user_allowed(user_id):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
@@ -808,7 +803,6 @@ async def price_handler(message: Message):
         await message.answer("❌ Модель не найдена.")
         return
     
-    # Сохраняем историю поиска
     USER_SEARCH_HISTORY[user_id] = {
         "gift_id": gift_id,
         "min_price": min_price,
@@ -818,9 +812,7 @@ async def price_handler(message: Message):
     
     status = await message.answer(f"⏳ Ищу {base.title} от {min_price} до {max_price}⭐...")
     
-    # Разная логика для режимов
     if mode == "parse":
-        # Обычный парсинг - все подарки
         seen = get_manual_seen(gift_id, min_price, max_price)
         results = await find_market_gifts(
             gift_id=gift_id,
@@ -832,7 +824,6 @@ async def price_handler(message: Message):
         remember_manual_results(gift_id, min_price, max_price, results)
         title = f"🎁 {base.title}"
     else:
-        # Новые подарки - только новые для этого пользователя
         if user_id not in USER_NEW_SEEN:
             USER_NEW_SEEN[user_id] = set()
         seen = USER_NEW_SEEN[user_id]
@@ -843,7 +834,6 @@ async def price_handler(message: Message):
             need=SEARCH_RESULT_LIMIT,
             skip_slugs=seen
         )
-        # Запоминаем новые подарки
         for gift in results:
             USER_NEW_SEEN[user_id].add(gift.slug)
         save_user_new_seen()
@@ -985,13 +975,11 @@ async def ban_owner_callback(callback: CallbackQuery):
         await callback.answer("Ошибка", show_alert=True)
         return
     
-    # Получаем результаты из последнего поиска
     search = USER_SEARCH_HISTORY.get(user_id)
     if not search:
         await callback.answer("Нет результатов", show_alert=True)
         return
     
-    # Заново ищем, чтобы получить объекты
     gift_id = search["gift_id"]
     min_price = search["min_price"]
     max_price = search["max_price"]
@@ -1030,7 +1018,6 @@ async def ban_owner_callback(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "blacklist")
 async def show_blacklist(callback: CallbackQuery):
-    """Показать чёрный список - видят все"""
     if not OWNERS_BLACKLIST:
         text = "🚫 Чёрный список пуст"
     else:
@@ -1320,10 +1307,7 @@ async def check_session_and_alert():
         try:
             await bot.send_message(
                 ADMIN_ID,
-                "🚨 **СЕССИЯ ТЕЛЕГРАМ ПОТЕРЯНА!**\n\n"
-                "Аккаунт разлогинился.\n"
-                "Восстановите сессию командой /add_session",
-                parse_mode="Markdown"
+                "🚨 СЕССИЯ ТЕЛЕГРАМ ПОТЕРЯНА!\n\nАккаунт разлогинился.\nВосстановите сессию командой /add_session"
             )
             log.warning("Session loss alert sent to admin")
         except Exception as e:
@@ -1335,8 +1319,7 @@ async def check_session_and_alert():
         try:
             await bot.send_message(
                 ADMIN_ID,
-                "✅ **СЕССИЯ ВОССТАНОВЛЕНА**",
-                parse_mode="Markdown"
+                "✅ СЕССИЯ ВОССТАНОВЛЕНА"
             )
         except Exception:
             pass
@@ -1344,7 +1327,6 @@ async def check_session_and_alert():
 
 
 async def session_monitor():
-    """Фоновый мониторинг сессии"""
     while True:
         await asyncio.sleep(60)
         await check_session_and_alert()
@@ -1385,13 +1367,11 @@ async def main():
         try:
             await bot.send_message(
                 ADMIN_ID,
-                "🚨 **СЕССИЯ НЕ АКТИВНА!**\n\nИспользуйте /add_session",
-                parse_mode="Markdown"
+                "🚨 СЕССИЯ НЕ АКТИВНА!\n\nИспользуйте /add_session"
             )
         except Exception as e:
             log.error("Failed to send session alert: %s", e)
 
-    # Запускаем мониторинг сессии
     asyncio.create_task(session_monitor())
 
     log.info("Bot polling started")
