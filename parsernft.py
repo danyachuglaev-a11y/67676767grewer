@@ -66,7 +66,7 @@ user_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 BASE_GIFTS: List["BaseGift"] = []
 BASE_GIFTS_BY_ID: Dict[int, "BaseGift"] = {}
-USER_MODE: Dict[int, str] = {}  # "parse" или "new"
+USER_MODE: Dict[int, str] = {}
 USER_SELECTED_GIFT: Dict[int, int] = {}
 OWNERS_BLACKLIST: Dict[str, str] = {}
 SEEN_GIFTS_BY_QUERY: Dict[str, List[str]] = {}
@@ -630,16 +630,52 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
 
 
 # ============================================================
-# ОБРАБОТЧИКИ РЕЖИМОВ
+# ХЕНДЛЕРЫ
 # ============================================================
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    user_id = message.from_user.id
+    
+    if not await is_user_client_authorized():
+        if is_admin(user_id):
+            await message.answer(
+                "⚠️ Сессия не добавлена!\n\nИспользуй /add_session",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="➕ ДОБАВИТЬ СЕССИЮ", callback_data="add_session_btn")]
+                ])
+            )
+        else:
+            await message.answer("⚠️ Бот настраивается. Подождите.")
+        return
+    
+    await ensure_models_loaded()
+    await message.answer(
+        "🎁 ПАРСЕР ПОДАРКОВ\n\n"
+        "Выбери режим:\n"
+        "📦 ОБЫЧНЫЙ ПАРСИНГ - все подарки на маркете\n"
+        "🆕 НОВЫЕ ПОДАРКИ - только свежие поступления\n\n"
+        "Банить владельцев могут ВСЕ!",
+        reply_markup=main_menu_keyboard(user_id)
+    )
+
+
+@dp.callback_query(F.data == "menu")
+async def menu(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    await callback.message.edit_text(
+        "🎁 ГЛАВНОЕ МЕНЮ\n\nВыбери режим:",
+        reply_markup=main_menu_keyboard(user_id)
+    )
+    await callback.answer()
+
 
 @dp.callback_query(F.data == "mode_parse")
 async def mode_parse(callback: CallbackQuery):
     user_id = callback.from_user.id
     USER_MODE[user_id] = "parse"
     await callback.message.edit_text(
-        "📦 ОБЫЧНЫЙ ПАРСИНГ\n\n"
-        "Выбери модель подарка:",
+        "📦 ОБЫЧНЫЙ ПАРСИНГ\n\nВыбери модель:",
         reply_markup=models_keyboard(0, "parse")
     )
     await callback.answer()
@@ -650,9 +686,7 @@ async def mode_new(callback: CallbackQuery):
     user_id = callback.from_user.id
     USER_MODE[user_id] = "new"
     await callback.message.edit_text(
-        "🆕 НОВЫЕ ПОДАРКИ\n\n"
-        "Выбери модель подарка:\n"
-        "(будут показаны только новые подарки)",
+        "🆕 НОВЫЕ ПОДАРКИ\n\nВыбери модель:",
         reply_markup=models_keyboard(0, "new")
     )
     await callback.answer()
@@ -716,10 +750,6 @@ async def gift_new(callback: CallbackQuery):
     )
     await callback.answer()
 
-
-# ============================================================
-# ОБРАБОТКА ЦЕН
-# ============================================================
 
 @dp.message()
 async def price_handler(message: Message):
@@ -814,10 +844,6 @@ async def send_search_results(message: Message, title: str, results: List[Market
     )
 
 
-# ============================================================
-# КНОПКИ РЕЗУЛЬТАТОВ
-# ============================================================
-
 @dp.callback_query(F.data.startswith("repeat_search:"))
 async def repeat_search(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -902,7 +928,6 @@ async def clear_seen(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("ban_owner:"))
 async def ban_owner_callback(callback: CallbackQuery):
-    """Бан владельца - МОГУТ ВСЕ"""
     user_id = callback.from_user.id
     
     try:
@@ -949,10 +974,6 @@ async def ban_owner_callback(callback: CallbackQuery):
     await callback.answer(f"✅ Забанен {owner.display}")
 
 
-# ============================================================
-# ЧЁРНЫЙ СПИСОК
-# ============================================================
-
 @dp.callback_query(F.data == "blacklist")
 async def show_blacklist(callback: CallbackQuery):
     if not OWNERS_BLACKLIST:
@@ -982,10 +1003,6 @@ async def clear_blacklist(callback: CallbackQuery):
     await callback.answer("🧹 Чёрный список очищен")
     await show_blacklist(callback)
 
-
-# ============================================================
-# АДМИН-ПАНЕЛЬ
-# ============================================================
 
 @dp.callback_query(F.data == "admin_panel")
 async def admin_panel(callback: CallbackQuery):
@@ -1060,52 +1077,6 @@ async def bot_status_callback(callback: CallbackQuery):
         f"🚫 В черном списке: {len(OWNERS_BLACKLIST)}"
     )
     await callback.message.edit_text(text)
-    await callback.answer()
-
-
-# ============================================================
-# ОБЩИЕ КОМАНДЫ
-# ============================================================
-
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    user_id = message.from_user.id
-    
-    # Проверка сессии
-    if not await is_user_client_authorized():
-        if is_admin(user_id):
-            await message.answer(
-                "⚠️ Сессия не добавлена!\n\nИспользуй /add_session",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="➕ ДОБАВИТЬ СЕССИЮ", callback_data="add_session_btn")]
-                ])
-            )
-        else:
-            await message.answer("⚠️ Бот настраивается. Подождите.")
-        return
-    
-    # Загружаем модели
-    await ensure_models_loaded()
-    
-    # Отправляем главное меню
-    await message.answer(
-        "🎁 ПАРСЕР ПОДАРКОВ\n\n"
-        "Выбери режим:\n"
-        "📦 ОБЫЧНЫЙ ПАРСИНГ - все подарки на маркете\n"
-        "🆕 НОВЫЕ ПОДАРКИ - только свежие поступления\n\n"
-        "Банить владельцев могут ВСЕ пользователи!",
-        reply_markup=main_menu_keyboard(user_id)
-    )
-
-
-@dp.callback_query(F.data == "menu")
-async def menu(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    await callback.message.edit_text(
-        "🎁 ГЛАВНОЕ МЕНЮ\n\n"
-        "Выбери режим работы:",
-        reply_markup=main_menu_keyboard(user_id)
-    )
     await callback.answer()
 
 
