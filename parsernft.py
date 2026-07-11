@@ -52,7 +52,6 @@ MAX_MARKET_PAGES = 30
 SEEN_MANUAL_FILE = "seen_manual.json"
 OWNER_BLACKLIST_FILE = "owner_blacklist.json"
 OWNER_CACHE_FILE = "owner_cache.json"
-WHITELIST_FILE = "whitelist_users.json"
 USER_NEW_SEEN_FILE = "user_new_seen.json"
 
 logging.basicConfig(
@@ -72,7 +71,6 @@ USER_SELECTED_GIFT: Dict[int, int] = {}
 OWNERS_BLACKLIST: Dict[str, str] = {}
 SEEN_GIFTS_BY_QUERY: Dict[str, List[str]] = {}
 OWNER_CACHE: Dict[int, "OwnerInfo"] = {}
-WHITELIST_USERS: Set[int] = set()
 USER_NEW_SEEN: Dict[int, Set[str]] = {}  # Для режима "Новые подарки"
 USER_SEARCH_HISTORY: Dict[int, Dict] = {}
 
@@ -180,17 +178,6 @@ def save_owner_cache() -> None:
     save_json(OWNER_CACHE_FILE, OWNER_CACHE)
 
 
-def load_whitelist() -> Set[int]:
-    data = load_json(WHITELIST_FILE, [])
-    if isinstance(data, list):
-        return {int(x) for x in data if x}
-    return set()
-
-
-def save_whitelist() -> None:
-    save_json(WHITELIST_FILE, sorted(WHITELIST_USERS))
-
-
 def load_user_new_seen() -> Dict[int, Set[str]]:
     data = load_json(USER_NEW_SEEN_FILE, {})
     result = {}
@@ -213,14 +200,6 @@ def save_user_new_seen() -> None:
 
 def is_admin(user_id: Optional[int]) -> bool:
     return user_id == ADMIN_ID
-
-
-def is_user_allowed(user_id: Optional[int]) -> bool:
-    if not user_id:
-        return False
-    if is_admin(user_id):
-        return True
-    return user_id in WHITELIST_USERS
 
 
 def safe_int(value: Any, default: int = 0) -> int:
@@ -589,7 +568,6 @@ def main_menu_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
     ]
     if is_admin(user_id):
         rows.append([InlineKeyboardButton(text="⚙️ АДМИН-ПАНЕЛЬ", callback_data="admin_panel")])
-        rows.append([InlineKeyboardButton(text="👥 ВЫДАТЬ ДОСТУП", callback_data="grant_access_panel")])
     rows.append([InlineKeyboardButton(text="🔄 ОБНОВИТЬ МОДЕЛИ", callback_data="reload_models")])
     rows.append([InlineKeyboardButton(text="🚫 ЧЁРНЫЙ СПИСОК", callback_data="blacklist")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -647,16 +625,7 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔐 ПРОВЕРИТЬ СЕССИЮ", callback_data="check_session_admin")],
         [InlineKeyboardButton(text="➕ ДОБАВИТЬ СЕССИЮ", callback_data="add_session_btn")],
         [InlineKeyboardButton(text="📊 СТАТУС БОТА", callback_data="bot_status")],
-        [InlineKeyboardButton(text="👥 ВЫДАТЬ ДОСТУП", callback_data="grant_access_panel")],
         [InlineKeyboardButton(text="🏠 ГЛАВНОЕ", callback_data="menu")]
-    ])
-
-
-def grant_access_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ ВЫДАТЬ ПО ID", callback_data="grant_access")],
-        [InlineKeyboardButton(text="📋 СПИСОК РАЗРЕШЁННЫХ", callback_data="list_allowed")],
-        [InlineKeyboardButton(text="🔙 НАЗАД", callback_data="admin_panel")]
     ])
 
 
@@ -667,9 +636,6 @@ def grant_access_keyboard() -> InlineKeyboardMarkup:
 @dp.callback_query(F.data == "mode_parse")
 async def mode_parse(callback: CallbackQuery):
     user_id = callback.from_user.id
-    if not is_user_allowed(user_id):
-        await callback.answer("⛔ Доступ запрещён", show_alert=True)
-        return
     USER_MODE[user_id] = "parse"
     await callback.message.edit_text(
         "📦 ОБЫЧНЫЙ ПАРСИНГ\n\n"
@@ -682,9 +648,6 @@ async def mode_parse(callback: CallbackQuery):
 @dp.callback_query(F.data == "mode_new")
 async def mode_new(callback: CallbackQuery):
     user_id = callback.from_user.id
-    if not is_user_allowed(user_id):
-        await callback.answer("⛔ Доступ запрещён", show_alert=True)
-        return
     USER_MODE[user_id] = "new"
     await callback.message.edit_text(
         "🆕 НОВЫЕ ПОДАРКИ\n\n"
@@ -697,10 +660,6 @@ async def mode_new(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("models_parse:"))
 async def models_parse_page(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_user_allowed(user_id):
-        await callback.answer("⛔ Доступ запрещён", show_alert=True)
-        return
     page = int(callback.data.split(":")[1])
     await callback.message.edit_text(
         "📦 ОБЫЧНЫЙ ПАРСИНГ\n\nВыбери модель:",
@@ -711,10 +670,6 @@ async def models_parse_page(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("models_new:"))
 async def models_new_page(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_user_allowed(user_id):
-        await callback.answer("⛔ Доступ запрещён", show_alert=True)
-        return
     page = int(callback.data.split(":")[1])
     await callback.message.edit_text(
         "🆕 НОВЫЕ ПОДАРКИ\n\nВыбери модель:",
@@ -726,9 +681,6 @@ async def models_new_page(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("gift_parse:"))
 async def gift_parse(callback: CallbackQuery):
     user_id = callback.from_user.id
-    if not is_user_allowed(user_id):
-        await callback.answer("⛔ Доступ запрещён", show_alert=True)
-        return
     gift_id = int(callback.data.split(":")[1])
     USER_SELECTED_GIFT[user_id] = gift_id
     USER_MODE[user_id] = "parse"
@@ -748,9 +700,6 @@ async def gift_parse(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("gift_new:"))
 async def gift_new(callback: CallbackQuery):
     user_id = callback.from_user.id
-    if not is_user_allowed(user_id):
-        await callback.answer("⛔ Доступ запрещён", show_alert=True)
-        return
     gift_id = int(callback.data.split(":")[1])
     USER_SELECTED_GIFT[user_id] = gift_id
     USER_MODE[user_id] = "new"
@@ -775,9 +724,6 @@ async def gift_new(callback: CallbackQuery):
 @dp.message()
 async def price_handler(message: Message):
     user_id = message.from_user.id
-    if not is_user_allowed(user_id):
-        await message.answer("⛔ Доступ запрещён. Обратитесь к @rozuvu")
-        return
     
     if user_id not in USER_SELECTED_GIFT:
         return
@@ -875,9 +821,6 @@ async def send_search_results(message: Message, title: str, results: List[Market
 @dp.callback_query(F.data.startswith("repeat_search:"))
 async def repeat_search(callback: CallbackQuery):
     user_id = callback.from_user.id
-    if not is_user_allowed(user_id):
-        await callback.answer("⛔ Доступ запрещён", show_alert=True)
-        return
     
     mode = callback.data.split(":")[1]
     search = USER_SEARCH_HISTORY.get(user_id)
@@ -937,9 +880,6 @@ async def repeat_search(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("clear_seen:"))
 async def clear_seen(callback: CallbackQuery):
     user_id = callback.from_user.id
-    if not is_user_allowed(user_id):
-        await callback.answer("⛔ Доступ запрещён", show_alert=True)
-        return
     
     mode = callback.data.split(":")[1]
     search = USER_SEARCH_HISTORY.get(user_id)
@@ -964,9 +904,6 @@ async def clear_seen(callback: CallbackQuery):
 async def ban_owner_callback(callback: CallbackQuery):
     """Бан владельца - МОГУТ ВСЕ"""
     user_id = callback.from_user.id
-    if not is_user_allowed(user_id):
-        await callback.answer("⛔ Доступ запрещён", show_alert=True)
-        return
     
     try:
         _, idx_str, mode = callback.data.split(":")
@@ -1064,8 +1001,7 @@ async def admin_panel(callback: CallbackQuery):
         f"🔐 Сессия: {status}\n"
         f"👤 Аккаунт: {account}\n"
         f"📦 Моделей: {len(BASE_GIFTS)}\n"
-        f"🚫 В черном списке: {len(OWNERS_BLACKLIST)}\n"
-        f"👥 Разрешённых юзеров: {len(WHITELIST_USERS)}",
+        f"🚫 В черном списке: {len(OWNERS_BLACKLIST)}",
         reply_markup=admin_panel_keyboard()
     )
     await callback.answer()
@@ -1121,105 +1057,9 @@ async def bot_status_callback(callback: CallbackQuery):
         text += f"👤 Аккаунт: {me.first_name} (@{me.username})\n"
     text += (
         f"📦 Моделей: {len(BASE_GIFTS)}\n"
-        f"🚫 В черном списке: {len(OWNERS_BLACKLIST)}\n"
-        f"👥 Разрешённых юзеров: {len(WHITELIST_USERS)}"
+        f"🚫 В черном списке: {len(OWNERS_BLACKLIST)}"
     )
     await callback.message.edit_text(text)
-    await callback.answer()
-
-
-# ============================================================
-# ВЫДАЧА ДОСТУПА
-# ============================================================
-
-@dp.callback_query(F.data == "grant_access_panel")
-async def grant_access_panel(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Только для админа")
-        return
-    await callback.message.edit_text(
-        "👥 УПРАВЛЕНИЕ ДОСТУПОМ\n\n"
-        "Для выдачи доступа отправьте команду:\n"
-        "/grant ID_пользователя\n\n"
-        "Например: /grant 123456789\n\n"
-        "Для отзыва: /revoke ID_пользователя",
-        reply_markup=grant_access_keyboard()
-    )
-    await callback.answer()
-
-
-@dp.message(Command("grant"))
-async def grant_access_command(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("⛔ Только для администратора")
-        return
-    parts = message.text.split()
-    if len(parts) != 2:
-        await message.answer("❌ Использование: /grant ID_пользователя")
-        return
-    try:
-        user_id = int(parts[1])
-    except ValueError:
-        await message.answer("❌ ID должен быть числом")
-        return
-    WHITELIST_USERS.add(user_id)
-    save_whitelist()
-    await message.answer(f"✅ Пользователь {user_id} добавлен в список разрешённых.")
-
-
-@dp.message(Command("revoke"))
-async def revoke_access_command(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("⛔ Только для администратора")
-        return
-    parts = message.text.split()
-    if len(parts) != 2:
-        await message.answer("❌ Использование: /revoke ID_пользователя")
-        return
-    try:
-        user_id = int(parts[1])
-    except ValueError:
-        await message.answer("❌ ID должен быть числом")
-        return
-    if user_id in WHITELIST_USERS:
-        WHITELIST_USERS.remove(user_id)
-        save_whitelist()
-        await message.answer(f"✅ Доступ отозван у {user_id}")
-    else:
-        await message.answer(f"❌ Пользователь {user_id} не в списке разрешённых.")
-
-
-@dp.callback_query(F.data == "grant_access")
-async def grant_access_callback(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Только для админа")
-        return
-    await callback.message.answer(
-        "Введите ID пользователя для выдачи доступа:\n"
-        "Пример: 123456789"
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "list_allowed")
-async def list_allowed_callback(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Только для админа")
-        return
-    if not WHITELIST_USERS:
-        text = "👥 Список разрешённых пуст."
-    else:
-        text = "👥 РАЗРЕШЁННЫЕ ПОЛЬЗОВАТЕЛИ:\n\n"
-        for uid in sorted(WHITELIST_USERS):
-            try:
-                user = await bot.get_chat(uid)
-                name = user.full_name or user.username or str(uid)
-                text += f"• {name} (ID: {uid})\n"
-            except Exception:
-                text += f"• ID: {uid}\n"
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 НАЗАД", callback_data="grant_access_panel")]
-    ]))
     await callback.answer()
 
 
@@ -1230,13 +1070,6 @@ async def list_allowed_callback(callback: CallbackQuery):
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     user_id = message.from_user.id
-    
-    if not is_user_allowed(user_id):
-        await message.answer(
-            "⛔ У вас нет доступа к этому боту.\n\n"
-            "Для получения доступа обратитесь к администратору: @rozuvu"
-        )
-        return
     
     if not await is_user_client_authorized():
         if is_admin(user_id):
@@ -1264,9 +1097,6 @@ async def cmd_start(message: Message):
 @dp.callback_query(F.data == "menu")
 async def menu(callback: CallbackQuery):
     user_id = callback.from_user.id
-    if not is_user_allowed(user_id):
-        await callback.answer("⛔ Доступ запрещён", show_alert=True)
-        return
     await callback.message.edit_text(
         "🎁 ГЛАВНОЕ МЕНЮ\n\n"
         "Выбери режим работы:",
@@ -1338,18 +1168,16 @@ async def session_monitor():
 
 async def main():
     global SEEN_GIFTS_BY_QUERY, OWNERS_BLACKLIST, OWNER_CACHE
-    global WHITELIST_USERS, USER_NEW_SEEN
+    global USER_NEW_SEEN
 
     SEEN_GIFTS_BY_QUERY = load_seen_manual()
     OWNERS_BLACKLIST = load_owner_blacklist()
     OWNER_CACHE = load_owner_cache()
-    WHITELIST_USERS = load_whitelist()
     USER_NEW_SEEN = load_user_new_seen()
 
     log.info(
-        "Loaded: manual_queries=%s | blacklist=%s | whitelist=%s | user_new_seen=%s",
-        len(SEEN_GIFTS_BY_QUERY), len(OWNERS_BLACKLIST),
-        len(WHITELIST_USERS), len(USER_NEW_SEEN)
+        "Loaded: manual_queries=%s | blacklist=%s | user_new_seen=%s",
+        len(SEEN_GIFTS_BY_QUERY), len(OWNERS_BLACKLIST), len(USER_NEW_SEEN)
     )
 
     await ensure_user_client_connected()
