@@ -53,7 +53,7 @@ SEEN_MANUAL_FILE = "seen_manual.json"
 OWNER_BLACKLIST_FILE = "owner_blacklist.json"
 OWNER_CACHE_FILE = "owner_cache.json"
 WHITELIST_FILE = "whitelist_users.json"
-USER_MONITOR_SESSIONS_FILE = "user_monitor_sessions.json"
+USER_NEW_SEEN_FILE = "user_new_seen.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,14 +67,14 @@ user_client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 BASE_GIFTS: List["BaseGift"] = []
 BASE_GIFTS_BY_ID: Dict[int, "BaseGift"] = {}
+USER_MODE: Dict[int, str] = {}  # "parse" или "new"
 USER_SELECTED_GIFT: Dict[int, int] = {}
-LAST_SEARCH_BY_USER: Dict[int, Dict[str, int]] = {}
-LAST_RESULTS_BY_USER: Dict[int, List["MarketGift"]] = {}
 OWNERS_BLACKLIST: Dict[str, str] = {}
 SEEN_GIFTS_BY_QUERY: Dict[str, List[str]] = {}
 OWNER_CACHE: Dict[int, "OwnerInfo"] = {}
 WHITELIST_USERS: Set[int] = set()
-USER_MONITOR_SESSIONS: Dict[int, "UserMonitorSession"] = {}
+USER_NEW_SEEN: Dict[int, Set[str]] = {}  # Для режима "Новые подарки"
+USER_SEARCH_HISTORY: Dict[int, Dict] = {}
 
 session_alert_sent = False
 
@@ -115,19 +115,6 @@ class MarketGift:
     @property
     def link(self) -> str:
         return f"https://t.me/nft/{self.slug}"
-
-
-@dataclass
-class UserMonitorSession:
-    user_id: int
-    active: bool = False
-    gift_ids: List[int] = field(default_factory=list)
-    min_price: int = 0
-    max_price: int = 999999
-    limit: int = 10
-    seen_slugs: Set[str] = field(default_factory=set)
-    last_results: List[MarketGift] = field(default_factory=list)
-    last_message_id: Optional[int] = None
 
 
 class AuthState(StatesGroup):
@@ -204,41 +191,20 @@ def save_whitelist() -> None:
     save_json(WHITELIST_FILE, sorted(WHITELIST_USERS))
 
 
-def load_user_monitor_sessions() -> Dict[int, UserMonitorSession]:
-    data = load_json(USER_MONITOR_SESSIONS_FILE, {})
-    sessions = {}
-    for uid_str, cfg in data.items():
+def load_user_new_seen() -> Dict[int, Set[str]]:
+    data = load_json(USER_NEW_SEEN_FILE, {})
+    result = {}
+    for k, v in data.items():
         try:
-            uid = int(uid_str)
-            sess = UserMonitorSession(
-                user_id=uid,
-                active=cfg.get("active", False),
-                gift_ids=cfg.get("gift_ids", []),
-                min_price=cfg.get("min_price", 0),
-                max_price=cfg.get("max_price", 999999),
-                limit=cfg.get("limit", 10),
-                seen_slugs=set(cfg.get("seen_slugs", [])),
-                last_message_id=cfg.get("last_message_id")
-            )
-            sessions[uid] = sess
-        except Exception as e:
-            log.error(f"Error loading session {uid_str}: {e}")
-    return sessions
+            result[int(k)] = set(v)
+        except Exception:
+            pass
+    return result
 
 
-def save_user_monitor_sessions() -> None:
-    data = {}
-    for uid, sess in USER_MONITOR_SESSIONS.items():
-        data[str(uid)] = {
-            "active": sess.active,
-            "gift_ids": sess.gift_ids,
-            "min_price": sess.min_price,
-            "max_price": sess.max_price,
-            "limit": sess.limit,
-            "seen_slugs": list(sess.seen_slugs),
-            "last_message_id": sess.last_message_id
-        }
-    save_json(USER_MONITOR_SESSIONS_FILE, data)
+def save_user_new_seen() -> None:
+    data = {str(k): list(v) for k, v in USER_NEW_SEEN.items()}
+    save_json(USER_NEW_SEEN_FILE, data)
 
 
 # ============================================================
@@ -613,550 +579,23 @@ async def find_market_gifts(
 
 
 # ============================================================
-# ПЕРСОНАЛЬНЫЙ МОНИТОРИНГ
-# ============================================================
-
-async def perform_monitor_search(user_id: int) -> None:
-    """Поиск новых подарков для пользователя"""
-    sess = USER_MONITOR_SESSIONS.get(user_id)
-    if not sess or not sess.active:
-        return
-    
-    await ensure_models_loaded()
-    
-    models_to_scan = sess.gift_ids if sess.gift_ids else [g.gift_id for g in BASE_GIFTS]
-    new_gifts = []
-    
-    for gift_id in models_to_scan:
-        if len(new_gifts) >= sess.limit:
-            break
-        
-        try:
-            result = await get_resale_page(
-                gift_id=gift_id,
-                offset="",
-                limit=sess.limit * 2,
-                sort_by_price=True
-            )
-            
-            for raw in getattr(result, "gifts", []) or []:
-                slug = get_field(raw, "slug")
-                if not slug or slug in sess.seen_slugs:
-                    continue
-                
-                price = extract_stars_amount(get_field(raw, "resell_amount"))
-                if price < sess.min_price or price > sess.max_price:
-                    sess.seen_slugs.add(slug)
-                    continue
-                
-                owner = await resolve_owner_info(raw)
-                if is_owner_blacklisted(owner):
-                    sess.seen_slugs.add(slug)
-                    continue
-                
-                gift = MarketGift(
-                    title=str(get_field(raw, "title") or "Gift"),
-                    num=safe_int(get_field(raw, "num")),
-                    slug=slug,
-                    price=price,
-                    owner=owner
-                )
-                
-                sess.seen_slugs.add(slug)
-                new_gifts.append(gift)
-                
-                if len(new_gifts) >= sess.limit:
-                    break
-        
-        except Exception as e:
-            log.error(f"Monitor search error for user {user_id}, model {gift_id}: {e}")
-        
-        await asyncio.sleep(0.5)
-    
-    sess.last_results = new_gifts
-    save_user_monitor_sessions()
-    
-    if new_gifts:
-        await send_monitor_results(user_id, new_gifts)
-    else:
-        await send_no_results_message(user_id)
-
-
-async def send_monitor_results(user_id: int, gifts: List[MarketGift]) -> None:
-    """Отправка результатов мониторинга"""
-    if not gifts:
-        return
-    
-    sess = USER_MONITOR_SESSIONS.get(user_id)
-    if not sess:
-        return
-    
-    text = f"🎁 НОВЫЕ ПОДАРКИ НА МАРКЕТЕ\n"
-    text += f"💰 Диапазон: {sess.min_price}—{sess.max_price} ⭐\n"
-    text += f"🔎 Найдено: {len(gifts)}\n\n"
-    
-    for i, gift in enumerate(gifts[:10], 1):
-        num = f" #{gift.num}" if gift.num else ""
-        text += (
-            f"{i}. 🎁 {gift.title}{num}\n"
-            f"💰 {gift.price} ⭐\n"
-            f"👤 {gift.owner.display}\n"
-            f"🔗 {gift.link}\n\n"
-        )
-    
-    if len(text) > 4000:
-        text = text[:3950] + "\n\n..."
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔁 ПОВТОРИТЬ ПОИСК", callback_data="monitor_repeat_search")],
-        [InlineKeyboardButton(text="🧹 СБРОСИТЬ ИСТОРИЮ", callback_data="monitor_clear_seen")],
-        [InlineKeyboardButton(text="📊 СТАТУС", callback_data="user_monitor_status")],
-        [InlineKeyboardButton(text="⏹ ОСТАНОВИТЬ", callback_data="user_monitor_stop")]
-    ])
-    
-    try:
-        if sess.last_message_id:
-            await bot.edit_message_text(
-                text,
-                chat_id=user_id,
-                message_id=sess.last_message_id,
-                reply_markup=keyboard,
-                disable_web_page_preview=True
-            )
-        else:
-            msg = await bot.send_message(
-                user_id,
-                text,
-                reply_markup=keyboard,
-                disable_web_page_preview=True
-            )
-            sess.last_message_id = msg.message_id
-    except Exception as e:
-        log.warning(f"Failed to edit message for {user_id}: {e}")
-        msg = await bot.send_message(
-            user_id,
-            text,
-            reply_markup=keyboard,
-            disable_web_page_preview=True
-        )
-        sess.last_message_id = msg.message_id
-    
-    save_user_monitor_sessions()
-
-
-async def send_no_results_message(user_id: int) -> None:
-    """Отправка сообщения, что ничего не найдено"""
-    sess = USER_MONITOR_SESSIONS.get(user_id)
-    if not sess:
-        return
-    
-    text = (
-        f"🔍 НОВЫХ ПОДАРКОВ НЕ НАЙДЕНО\n\n"
-        f"📦 Модели: {'Все' if not sess.gift_ids else f'{len(sess.gift_ids)} моделей'}\n"
-        f"💰 Цена: {sess.min_price}—{sess.max_price} ⭐\n\n"
-        f"Нажмите 'ПОВТОРИТЬ ПОИСК' чтобы проверить снова."
-    )
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔁 ПОВТОРИТЬ ПОИСК", callback_data="monitor_repeat_search")],
-        [InlineKeyboardButton(text="📊 СТАТУС", callback_data="user_monitor_status")],
-        [InlineKeyboardButton(text="⏹ ОСТАНОВИТЬ", callback_data="user_monitor_stop")]
-    ])
-    
-    try:
-        if sess.last_message_id:
-            await bot.edit_message_text(
-                text,
-                chat_id=user_id,
-                message_id=sess.last_message_id,
-                reply_markup=keyboard
-            )
-        else:
-            msg = await bot.send_message(user_id, text, reply_markup=keyboard)
-            sess.last_message_id = msg.message_id
-    except Exception:
-        msg = await bot.send_message(user_id, text, reply_markup=keyboard)
-        sess.last_message_id = msg.message_id
-    
-    save_user_monitor_sessions()
-
-
-# ============================================================
-# КНОПКИ МОНИТОРИНГА
-# ============================================================
-
-@dp.callback_query(F.data == "monitor_repeat_search")
-async def monitor_repeat_search(callback: CallbackQuery):
-    """ПОВТОРИТЬ ПОИСК"""
-    user_id = callback.from_user.id
-    sess = USER_MONITOR_SESSIONS.get(user_id)
-    
-    if not sess or not sess.active:
-        await callback.answer("⚠️ Мониторинг не активен", show_alert=True)
-        return
-    
-    await callback.answer("🔄 Ищу новые подарки...")
-    await perform_monitor_search(user_id)
-
-
-@dp.callback_query(F.data == "monitor_clear_seen")
-async def monitor_clear_seen(callback: CallbackQuery):
-    """Сброс истории"""
-    user_id = callback.from_user.id
-    sess = USER_MONITOR_SESSIONS.get(user_id)
-    
-    if not sess or not sess.active:
-        await callback.answer("❌ Мониторинг не запущен", show_alert=True)
-        return
-    
-    sess.seen_slugs = set()
-    save_user_monitor_sessions()
-    
-    await callback.answer("🧹 История сброшена")
-    await perform_monitor_search(user_id)
-
-
-@dp.callback_query(F.data == "user_monitor_status")
-async def user_monitor_status(callback: CallbackQuery):
-    """Статус мониторинга"""
-    user_id = callback.from_user.id
-    sess = USER_MONITOR_SESSIONS.get(user_id)
-    
-    if not sess or not sess.active:
-        await callback.answer("📊 Мониторинг НЕ АКТИВЕН")
-        return
-    
-    model_names = []
-    if sess.gift_ids:
-        for gid in sess.gift_ids[:5]:
-            gift = BASE_GIFTS_BY_ID.get(gid)
-            if gift:
-                model_names.append(gift.title)
-        if len(sess.gift_ids) > 5:
-            model_names.append(f"... и ещё {len(sess.gift_ids) - 5}")
-    else:
-        model_names.append("Все модели")
-    
-    text = (
-        f"📊 СТАТУС МОНИТОРИНГА\n\n"
-        f"🟢 Активен: ДА\n"
-        f"📦 Модели: {', '.join(model_names)}\n"
-        f"💰 Диапазон: {sess.min_price}—{sess.max_price} ⭐\n"
-        f"🔢 Лимит: {sess.limit}\n"
-        f"📤 Найдено за сессию: {len(sess.seen_slugs)} шт.\n"
-        f"📋 Последних результатов: {len(sess.last_results)}"
-    )
-    
-    await callback.message.edit_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔁 ПОВТОРИТЬ ПОИСК", callback_data="monitor_repeat_search")],
-            [InlineKeyboardButton(text="🔙 НАЗАД", callback_data="monitor_repeat_search")]
-        ])
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "user_monitor_stop")
-async def user_monitor_stop(callback: CallbackQuery):
-    """Остановка мониторинга"""
-    user_id = callback.from_user.id
-    sess = USER_MONITOR_SESSIONS.get(user_id)
-    
-    if not sess or not sess.active:
-        await callback.answer("⚠️ Мониторинг уже остановлен")
-        return
-    
-    sess.active = False
-    sess.last_message_id = None
-    save_user_monitor_sessions()
-    
-    await callback.answer("✅ Мониторинг остановлен")
-    await callback.message.edit_text(
-        "⏹ МОНИТОРИНГ ОСТАНОВЛЕН\n\n"
-        "Чтобы запустить снова - используй /monitor",
-        reply_markup=main_menu_keyboard(user_id)
-    )
-
-
-# ============================================================
-# ЗАПУСК МОНИТОРИНГА
-# ============================================================
-
-@dp.message(Command("monitor"))
-async def cmd_monitor(message: Message):
-    """Запуск мониторинга"""
-    user_id = message.from_user.id
-    if not is_user_allowed(user_id):
-        await message.answer("⛔ Доступ запрещён. Обратитесь к @rozuvu")
-        return
-    
-    if not await is_user_client_authorized():
-        await message.answer("⚠️ Сессия не активна. Обратитесь к админу")
-        return
-    
-    sess = USER_MONITOR_SESSIONS.get(user_id)
-    if sess and sess.active:
-        await message.answer("⚠️ Мониторинг уже запущен. Используй /status")
-        return
-    
-    if not sess:
-        sess = UserMonitorSession(user_id=user_id)
-        USER_MONITOR_SESSIONS[user_id] = sess
-    
-    await show_monitor_setup(message)
-
-
-async def show_monitor_setup(message: Message):
-    """Показывает настройки мониторинга"""
-    user_id = message.from_user.id
-    sess = USER_MONITOR_SESSIONS.get(user_id)
-    
-    if not sess:
-        return
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎯 ВЫБРАТЬ МОДЕЛЬ", callback_data="monitor_select_model")],
-        [InlineKeyboardButton(text="💰 УСТАНОВИТЬ ЦЕНУ", callback_data="monitor_set_price")],
-        [InlineKeyboardButton(text="🔢 УСТАНОВИТЬ ЛИМИТ", callback_data="monitor_set_limit")],
-        [InlineKeyboardButton(text="▶️ ЗАПУСТИТЬ МОНИТОРИНГ", callback_data="monitor_start_now")],
-        [InlineKeyboardButton(text="❌ ОТМЕНА", callback_data="menu")]
-    ])
-    
-    text = (
-        f"🎯 НАСТРОЙКА МОНИТОРИНГА\n\n"
-        f"Текущие настройки:\n"
-        f"📦 Модель: {'Все' if not sess.gift_ids else f'{len(sess.gift_ids)} моделей'}\n"
-        f"💰 Цена: {sess.min_price}—{sess.max_price} ⭐\n"
-        f"🔢 Лимит: {sess.limit} подарков\n\n"
-        f"После запуска нажмите 'ПОВТОРИТЬ ПОИСК' для обновления"
-    )
-    
-    await message.answer(text, reply_markup=keyboard)
-
-
-@dp.callback_query(F.data == "monitor_start_now")
-async def monitor_start_now(callback: CallbackQuery):
-    """Запуск мониторинга из настроек"""
-    user_id = callback.from_user.id
-    if not is_user_allowed(user_id):
-        await callback.answer("⛔ Доступ запрещён")
-        return
-    
-    sess = USER_MONITOR_SESSIONS.get(user_id)
-    if not sess:
-        sess = UserMonitorSession(user_id=user_id)
-        USER_MONITOR_SESSIONS[user_id] = sess
-    
-    if sess.active:
-        await callback.answer("⚠️ Уже запущен")
-        return
-    
-    sess.active = True
-    sess.seen_slugs = set()
-    save_user_monitor_sessions()
-    
-    await callback.answer("✅ Мониторинг запущен!")
-    await perform_monitor_search(user_id)
-    
-    await callback.message.edit_text(
-        "🟢 МОНИТОРИНГ ЗАПУЩЕН\n\n"
-        f"📦 Модели: {'Все' if not sess.gift_ids else f'{len(sess.gift_ids)} моделей'}\n"
-        f"💰 Цена: {sess.min_price}—{sess.max_price} ⭐\n"
-        f"🔢 Лимит: {sess.limit} подарков\n\n"
-        f"Результаты будут показаны выше.\n"
-        f"Для обновления нажмите 'ПОВТОРИТЬ ПОИСК'",
-        reply_markup=main_menu_keyboard(user_id)
-    )
-
-
-@dp.callback_query(F.data == "monitor_select_model")
-async def monitor_select_model(callback: CallbackQuery):
-    """Выбор модели для мониторинга"""
-    user_id = callback.from_user.id
-    if not is_user_allowed(user_id):
-        await callback.answer("⛔ Доступ запрещён")
-        return
-    
-    await ensure_models_loaded()
-    
-    sess = USER_MONITOR_SESSIONS.get(user_id)
-    if not sess:
-        sess = UserMonitorSession(user_id=user_id)
-        USER_MONITOR_SESSIONS[user_id] = sess
-    
-    selected = set(sess.gift_ids)
-    keyboard = []
-    
-    for gift in BASE_GIFTS[:20]:
-        check = "✅ " if gift.gift_id in selected else ""
-        keyboard.append([
-            InlineKeyboardButton(
-                text=f"{check}{gift.title[:30]}",
-                callback_data=f"monitor_toggle_model:{gift.gift_id}"
-            )
-        ])
-    
-    keyboard.append([
-        InlineKeyboardButton(text="✅ ВСЕ МОДЕЛИ", callback_data="monitor_select_all")
-    ])
-    keyboard.append([
-        InlineKeyboardButton(text="❌ ОЧИСТИТЬ ВСЕ", callback_data="monitor_clear_models")
-    ])
-    keyboard.append([
-        InlineKeyboardButton(text="🔙 НАЗАД", callback_data="monitor_back_setup")
-    ])
-    
-    await callback.message.edit_text(
-        "🎯 ВЫБЕРИ МОДЕЛИ ДЛЯ МОНИТОРИНГА\n\n"
-        "✅ - выбрана\n"
-        "Пусто - не выбрана\n\n"
-        "Если ничего не выбрано - будут все модели",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("monitor_toggle_model:"))
-async def monitor_toggle_model(callback: CallbackQuery):
-    """Переключение модели"""
-    user_id = callback.from_user.id
-    gift_id = int(callback.data.split(":")[1])
-    
-    sess = USER_MONITOR_SESSIONS.get(user_id)
-    if not sess:
-        sess = UserMonitorSession(user_id=user_id)
-        USER_MONITOR_SESSIONS[user_id] = sess
-    
-    if gift_id in sess.gift_ids:
-        sess.gift_ids.remove(gift_id)
-    else:
-        sess.gift_ids.append(gift_id)
-    
-    save_user_monitor_sessions()
-    await monitor_select_model(callback)
-
-
-@dp.callback_query(F.data == "monitor_select_all")
-async def monitor_select_all(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    sess = USER_MONITOR_SESSIONS.get(user_id)
-    if not sess:
-        sess = UserMonitorSession(user_id=user_id)
-        USER_MONITOR_SESSIONS[user_id] = sess
-    
-    await ensure_models_loaded()
-    sess.gift_ids = [g.gift_id for g in BASE_GIFTS]
-    save_user_monitor_sessions()
-    await callback.answer("✅ Выбраны все модели")
-    await monitor_select_model(callback)
-
-
-@dp.callback_query(F.data == "monitor_clear_models")
-async def monitor_clear_models(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    sess = USER_MONITOR_SESSIONS.get(user_id)
-    if sess:
-        sess.gift_ids = []
-        save_user_monitor_sessions()
-    await callback.answer("✅ Список моделей очищен")
-    await monitor_select_model(callback)
-
-
-@dp.callback_query(F.data == "monitor_set_price")
-async def monitor_set_price(callback: CallbackQuery):
-    await callback.message.answer(
-        "💰 ВВЕДИ ДИАПАЗОН ЦЕН\n\n"
-        "Отправь два числа через пробел:\n"
-        "Пример: 700 900\n\n"
-        "Для отмены отправь /cancel"
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "monitor_set_limit")
-async def monitor_set_limit(callback: CallbackQuery):
-    await callback.message.answer(
-        "🔢 УСТАНОВИ ЛИМИТ ПОДАРКОВ ЗА ЦИКЛ\n\n"
-        "Отправь число от 1 до 50:\n"
-        "Пример: 10\n\n"
-        "Для отмены отправь /cancel"
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "monitor_back_setup")
-async def monitor_back_setup(callback: CallbackQuery):
-    await show_monitor_setup(callback.message)
-    await callback.answer()
-
-
-@dp.message(lambda msg: msg.text and " " in msg.text and msg.text.split()[0].isdigit())
-async def handle_price_input(message: Message):
-    user_id = message.from_user.id
-    if not is_user_allowed(user_id):
-        return
-    
-    parts = message.text.strip().split()
-    if len(parts) != 2:
-        await message.answer("❌ Отправь два числа: 500 800")
-        return
-    
-    try:
-        min_price = int(parts[0])
-        max_price = int(parts[1])
-        if min_price < 0 or max_price < 0 or min_price > max_price:
-            raise ValueError
-    except Exception:
-        await message.answer("❌ Введи корректные числа.")
-        return
-    
-    sess = USER_MONITOR_SESSIONS.get(user_id)
-    if not sess:
-        sess = UserMonitorSession(user_id=user_id)
-        USER_MONITOR_SESSIONS[user_id] = sess
-    
-    sess.min_price = min_price
-    sess.max_price = max_price
-    save_user_monitor_sessions()
-    
-    await message.answer(f"✅ Ценовой диапазон установлен: {min_price}—{max_price} ⭐")
-    await show_monitor_setup(message)
-
-
-@dp.message(lambda msg: msg.text and msg.text.isdigit() and 1 <= int(msg.text) <= 50)
-async def handle_limit_input(message: Message):
-    user_id = message.from_user.id
-    if not is_user_allowed(user_id):
-        return
-    
-    limit = int(message.text)
-    sess = USER_MONITOR_SESSIONS.get(user_id)
-    if not sess:
-        sess = UserMonitorSession(user_id=user_id)
-        USER_MONITOR_SESSIONS[user_id] = sess
-    
-    sess.limit = limit
-    save_user_monitor_sessions()
-    
-    await message.answer(f"✅ Лимит установлен: {limit} подарков")
-    await show_monitor_setup(message)
-
-
-# ============================================================
-# ОСНОВНЫЕ ХЕНДЛЕРЫ
+# КЛАВИАТУРЫ
 # ============================================================
 
 def main_menu_keyboard(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text="📦 ВЫБРАТЬ МОДЕЛЬ", callback_data="models:0")]]
+    rows = [
+        [InlineKeyboardButton(text="📦 ОБЫЧНЫЙ ПАРСИНГ", callback_data="mode_parse")],
+        [InlineKeyboardButton(text="🆕 НОВЫЕ ПОДАРКИ", callback_data="mode_new")],
+    ]
     if is_admin(user_id):
         rows.append([InlineKeyboardButton(text="⚙️ АДМИН-ПАНЕЛЬ", callback_data="admin_panel")])
-        rows.append([InlineKeyboardButton(text="🔄 ОБНОВИТЬ МОДЕЛИ", callback_data="reload_models")])
         rows.append([InlineKeyboardButton(text="👥 ВЫДАТЬ ДОСТУП", callback_data="grant_access_panel")])
+    rows.append([InlineKeyboardButton(text="🔄 ОБНОВИТЬ МОДЕЛИ", callback_data="reload_models")])
+    rows.append([InlineKeyboardButton(text="🚫 ЧЁРНЫЙ СПИСОК", callback_data="blacklist")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def models_keyboard(page: int = 0) -> InlineKeyboardMarkup:
+def models_keyboard(page: int = 0, mode: str = "parse") -> InlineKeyboardMarkup:
     total = len(BASE_GIFTS)
     start = page * GIFTS_PER_PAGE
     end = start + GIFTS_PER_PAGE
@@ -1167,25 +606,38 @@ def models_keyboard(page: int = 0) -> InlineKeyboardMarkup:
             text += f" · от {gift.resell_min_stars}⭐"
         if gift.availability_resale:
             text += f" · {gift.availability_resale} шт."
-        rows.append([InlineKeyboardButton(text=text[:64], callback_data=f"gift:{gift.gift_id}")])
+        rows.append([InlineKeyboardButton(
+            text=text[:64], 
+            callback_data=f"gift_{mode}:{gift.gift_id}"
+        )])
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"models:{page - 1}"))
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"models_{mode}:{page - 1}"))
     if end < total:
-        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"models:{page + 1}"))
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"models_{mode}:{page + 1}"))
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton(text="🏠 ГЛАВНОЕ", callback_data="menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def search_results_keyboard(results: List[MarketGift]) -> InlineKeyboardMarkup:
+def search_results_keyboard(results: List[MarketGift], mode: str = "parse") -> InlineKeyboardMarkup:
     rows = []
+    # Кнопки бана для каждого владельца (могут ВСЕ)
     for i, gift in enumerate(results[:10]):
         if gift.owner.key and gift.owner.key != "unknown":
-            rows.append([InlineKeyboardButton(text=f"🚫 Забанить {gift.owner.display}"[:64], callback_data=f"ban_owner:{i}")])
-    rows.append([InlineKeyboardButton(text="🔁 ПОВТОРИТЬ ПОИСК", callback_data="repeat_search")])
-    rows.append([InlineKeyboardButton(text="🧹 СБРОСИТЬ ИСТОРИЮ", callback_data="clear_seen")])
+            rows.append([InlineKeyboardButton(
+                text=f"🚫 Забанить {gift.owner.display}"[:64], 
+                callback_data=f"ban_owner:{i}:{mode}"
+            )])
+    rows.append([InlineKeyboardButton(
+        text="🔁 ПОВТОРИТЬ ПОИСК", 
+        callback_data=f"repeat_search:{mode}"
+    )])
+    rows.append([InlineKeyboardButton(
+        text="🧹 СБРОСИТЬ ИСТОРИЮ", 
+        callback_data=f"clear_seen:{mode}"
+    )])
     rows.append([InlineKeyboardButton(text="🚫 ЧЁРНЫЙ СПИСОК", callback_data="blacklist")])
     rows.append([InlineKeyboardButton(text="🏠 ГЛАВНОЕ", callback_data="menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1210,147 +662,84 @@ def grant_access_keyboard() -> InlineKeyboardMarkup:
 
 
 # ============================================================
-# ОСНОВНЫЕ ХЕНДЛЕРЫ
+# ОБРАБОТЧИКИ РЕЖИМОВ
 # ============================================================
 
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    user_id = message.from_user.id
-    
-    if not is_user_allowed(user_id):
-        await message.answer(
-            "⛔ У вас нет доступа к этому боту.\n\n"
-            "Для получения доступа обратитесь к администратору: @rozuvu"
-        )
-        return
-    
-    if not await is_user_client_authorized():
-        if is_admin(user_id):
-            await message.answer(
-                "⚠️ Сессия не добавлена!\n\nИспользуй /add_session",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="➕ ДОБАВИТЬ СЕССИЮ", callback_data="add_session_btn")]
-                ])
-            )
-        else:
-            await message.answer("⚠️ Бот настраивается. Подождите.")
-        return
-    
-    await ensure_models_loaded()
-    await message.answer(
-        "🎁 ПАРСЕР ПОДАРКОВ\n\n"
-        "📦 Выбери модель и введи диапазон цены.\n"
-        "📡 Мониторинг работает по кнопке 'ПОВТОРИТЬ ПОИСК'.\n\n"
-        "Пример цены: 500 800",
-        reply_markup=main_menu_keyboard(user_id)
-    )
-
-
-@dp.message(Command("status"))
-async def cmd_status(message: Message):
-    user_id = message.from_user.id
-    if not is_user_allowed(user_id):
-        await message.answer("⛔ Доступ запрещён")
-        return
-    
-    sess = USER_MONITOR_SESSIONS.get(user_id)
-    if not sess or not sess.active:
-        await message.answer("📊 Мониторинг НЕ АКТИВЕН")
-        return
-    
-    model_names = []
-    if sess.gift_ids:
-        for gid in sess.gift_ids[:5]:
-            gift = BASE_GIFTS_BY_ID.get(gid)
-            if gift:
-                model_names.append(gift.title)
-        if len(sess.gift_ids) > 5:
-            model_names.append(f"... и ещё {len(sess.gift_ids) - 5}")
-    else:
-        model_names.append("Все модели")
-    
-    text = (
-        f"📊 СТАТУС МОНИТОРИНГА\n\n"
-        f"🟢 Активен: ДА\n"
-        f"📦 Модели: {', '.join(model_names)}\n"
-        f"💰 Диапазон: {sess.min_price}—{sess.max_price} ⭐\n"
-        f"🔢 Лимит: {sess.limit}\n"
-        f"📤 Найдено за сессию: {len(sess.seen_slugs)} шт.\n"
-        f"📋 Последних результатов: {len(sess.last_results)}"
-    )
-    
-    await message.answer(text)
-
-
-@dp.message(Command("stop_monitor"))
-async def cmd_stop_monitor(message: Message):
-    user_id = message.from_user.id
-    if not is_user_allowed(user_id):
-        await message.answer("⛔ Доступ запрещён")
-        return
-    
-    sess = USER_MONITOR_SESSIONS.get(user_id)
-    if not sess or not sess.active:
-        await message.answer("⚠️ Мониторинг не запущен")
-        return
-    
-    sess.active = False
-    sess.last_message_id = None
-    save_user_monitor_sessions()
-    await message.answer("✅ Мониторинг остановлен")
-
-
-@dp.callback_query(F.data == "menu")
-async def menu(callback: CallbackQuery):
+@dp.callback_query(F.data == "mode_parse")
+async def mode_parse(callback: CallbackQuery):
+    """Режим обычного парсинга"""
     user_id = callback.from_user.id
     if not is_user_allowed(user_id):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
-    await callback.message.edit_text("🎁 ГЛАВНОЕ МЕНЮ", reply_markup=main_menu_keyboard(user_id))
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "reload_models")
-async def reload_models_callback(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Только для админа")
-        return
-    await callback.answer("Обновляю...")
-    await load_base_gifts()
-    await callback.message.edit_text(f"✅ Модели обновлены.\n\n📦 Загружено: {len(BASE_GIFTS)}", reply_markup=main_menu_keyboard(callback.from_user.id))
-
-
-@dp.callback_query(F.data.startswith("models:"))
-async def show_models(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    if not is_user_allowed(user_id):
-        await callback.answer("⛔ Доступ запрещён", show_alert=True)
-        return
-    await ensure_models_loaded()
-    try:
-        page = int(callback.data.split(":")[1])
-    except Exception:
-        page = 0
-    total_pages = max(1, (len(BASE_GIFTS) + GIFTS_PER_PAGE - 1) // GIFTS_PER_PAGE)
+    USER_MODE[user_id] = "parse"
     await callback.message.edit_text(
-        f"📦 ВЫБЕРИ МОДЕЛЬ\nСтраница {page + 1}/{total_pages}\n\nМоделей: {len(BASE_GIFTS)}",
-        reply_markup=models_keyboard(page)
+        "📦 ОБЫЧНЫЙ ПАРСИНГ\n\n"
+        "Выбери модель подарка:",
+        reply_markup=models_keyboard(0, "parse")
     )
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("gift:"))
-async def select_gift(callback: CallbackQuery):
+@dp.callback_query(F.data == "mode_new")
+async def mode_new(callback: CallbackQuery):
+    """Режим новых подарков"""
     user_id = callback.from_user.id
     if not is_user_allowed(user_id):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
-    gift_id = safe_int(callback.data.split(":")[1])
+    USER_MODE[user_id] = "new"
+    await callback.message.edit_text(
+        "🆕 НОВЫЕ ПОДАРКИ\n\n"
+        "Выбери модель подарка:\n"
+        "(будут показаны только новые подарки)",
+        reply_markup=models_keyboard(0, "new")
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("models_parse:"))
+async def models_parse_page(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not is_user_allowed(user_id):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    page = int(callback.data.split(":")[1])
+    await callback.message.edit_text(
+        "📦 ОБЫЧНЫЙ ПАРСИНГ\n\nВыбери модель:",
+        reply_markup=models_keyboard(page, "parse")
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("models_new:"))
+async def models_new_page(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not is_user_allowed(user_id):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    page = int(callback.data.split(":")[1])
+    await callback.message.edit_text(
+        "🆕 НОВЫЕ ПОДАРКИ\n\nВыбери модель:",
+        reply_markup=models_keyboard(page, "new")
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("gift_parse:"))
+async def gift_parse(callback: CallbackQuery):
+    """Выбор модели для обычного парсинга"""
+    user_id = callback.from_user.id
+    if not is_user_allowed(user_id):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    gift_id = int(callback.data.split(":")[1])
+    USER_SELECTED_GIFT[user_id] = gift_id
+    USER_MODE[user_id] = "parse"
     gift = BASE_GIFTS_BY_ID.get(gift_id)
     if not gift:
         await callback.answer("Модель не найдена", show_alert=True)
         return
-    USER_SELECTED_GIFT[user_id] = gift_id
     await callback.message.edit_text(
         f"✅ {gift.title}\n\n"
         f"💰 Мин. цена: {gift.resell_min_stars or 0}⭐\n"
@@ -1360,18 +749,49 @@ async def select_gift(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data.startswith("gift_new:"))
+async def gift_new(callback: CallbackQuery):
+    """Выбор модели для новых подарков"""
+    user_id = callback.from_user.id
+    if not is_user_allowed(user_id):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    gift_id = int(callback.data.split(":")[1])
+    USER_SELECTED_GIFT[user_id] = gift_id
+    USER_MODE[user_id] = "new"
+    gift = BASE_GIFTS_BY_ID.get(gift_id)
+    if not gift:
+        await callback.answer("Модель не найдена", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"🆕 {gift.title} (НОВЫЕ)\n\n"
+        f"💰 Мин. цена: {gift.resell_min_stars or 0}⭐\n"
+        f"📦 На маркете: {gift.availability_resale} шт.\n\n"
+        f"Отправь диапазон цены:\n500 800\n\n"
+        f"Будут показаны только новые подарки"
+    )
+    await callback.answer()
+
+
+# ============================================================
+# ОБРАБОТКА ЦЕН
+# ============================================================
+
 @dp.message()
 async def price_handler(message: Message):
     user_id = message.from_user.id
     if not is_user_allowed(user_id):
         await message.answer("⛔ Доступ запрещён. Обратитесь к @rozuvu")
         return
+    
     if user_id not in USER_SELECTED_GIFT:
         return
+    
     parts = message.text.strip().replace("-", " ").split()
     if len(parts) != 2:
         await message.answer("❌ Отправь два числа: 500 800")
         return
+    
     try:
         min_price = int(parts[0])
         max_price = int(parts[1])
@@ -1380,30 +800,69 @@ async def price_handler(message: Message):
     except Exception:
         await message.answer("❌ Введи корректные числа.")
         return
+    
     gift_id = USER_SELECTED_GIFT.pop(user_id)
+    mode = USER_MODE.get(user_id, "parse")
     base = BASE_GIFTS_BY_ID.get(gift_id)
     if not base:
         await message.answer("❌ Модель не найдена.")
         return
-    LAST_SEARCH_BY_USER[user_id] = {"gift_id": gift_id, "min_price": min_price, "max_price": max_price}
+    
+    # Сохраняем историю поиска
+    USER_SEARCH_HISTORY[user_id] = {
+        "gift_id": gift_id,
+        "min_price": min_price,
+        "max_price": max_price,
+        "mode": mode
+    }
+    
     status = await message.answer(f"⏳ Ищу {base.title} от {min_price} до {max_price}⭐...")
-    seen = get_manual_seen(gift_id, min_price, max_price)
-    results = await find_market_gifts(gift_id=gift_id, min_price=min_price, max_price=max_price, need=SEARCH_RESULT_LIMIT, skip_slugs=seen)
-    LAST_RESULTS_BY_USER[user_id] = results
-    remember_manual_results(gift_id, min_price, max_price, results)
+    
+    # Разная логика для режимов
+    if mode == "parse":
+        # Обычный парсинг - все подарки
+        seen = get_manual_seen(gift_id, min_price, max_price)
+        results = await find_market_gifts(
+            gift_id=gift_id,
+            min_price=min_price,
+            max_price=max_price,
+            need=SEARCH_RESULT_LIMIT,
+            skip_slugs=seen
+        )
+        remember_manual_results(gift_id, min_price, max_price, results)
+        title = f"🎁 {base.title}"
+    else:
+        # Новые подарки - только новые для этого пользователя
+        if user_id not in USER_NEW_SEEN:
+            USER_NEW_SEEN[user_id] = set()
+        seen = USER_NEW_SEEN[user_id]
+        results = await find_market_gifts(
+            gift_id=gift_id,
+            min_price=min_price,
+            max_price=max_price,
+            need=SEARCH_RESULT_LIMIT,
+            skip_slugs=seen
+        )
+        # Запоминаем новые подарки
+        for gift in results:
+            USER_NEW_SEEN[user_id].add(gift.slug)
+        save_user_new_seen()
+        title = f"🆕 {base.title} (НОВЫЕ)"
+    
     try:
         await status.delete()
     except Exception:
         pass
-    await send_search_results(message, base, results, min_price, max_price)
+    
+    await send_search_results(message, title, results, min_price, max_price, mode)
 
 
-async def send_search_results(message: Message, base: BaseGift, results: List[MarketGift], min_price: int, max_price: int) -> None:
+async def send_search_results(message: Message, title: str, results: List[MarketGift], min_price: int, max_price: int, mode: str) -> None:
     if not results:
-        await message.answer(f"❌ По модели {base.title} ничего не найдено в диапазоне {min_price}-{max_price} ⭐")
+        await message.answer(f"❌ {title}\nНичего не найдено в диапазоне {min_price}-{max_price} ⭐")
         return
     
-    text = f"🎁 {base.title}\n💰 Диапазон: {min_price}—{max_price} ⭐\n🔎 Найдено: {len(results)}\n\n"
+    text = f"{title}\n💰 Диапазон: {min_price}—{max_price} ⭐\n🔎 Найдено: {len(results)}\n\n"
     
     for i, gift in enumerate(results[:10], 1):
         num = f" #{gift.num}" if gift.num else ""
@@ -1415,20 +874,27 @@ async def send_search_results(message: Message, base: BaseGift, results: List[Ma
     await message.answer(
         text,
         disable_web_page_preview=True,
-        reply_markup=search_results_keyboard(results)
+        reply_markup=search_results_keyboard(results, mode)
     )
 
 
-@dp.callback_query(F.data == "repeat_search")
+# ============================================================
+# КНОПКИ РЕЗУЛЬТАТОВ
+# ============================================================
+
+@dp.callback_query(F.data.startswith("repeat_search:"))
 async def repeat_search(callback: CallbackQuery):
     user_id = callback.from_user.id
     if not is_user_allowed(user_id):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
-    search = LAST_SEARCH_BY_USER.get(user_id)
+    
+    mode = callback.data.split(":")[1]
+    search = USER_SEARCH_HISTORY.get(user_id)
     if not search:
         await callback.answer("Нет прошлого поиска", show_alert=True)
         return
+    
     gift_id = search["gift_id"]
     min_price = search["min_price"]
     max_price = search["max_price"]
@@ -1436,60 +902,135 @@ async def repeat_search(callback: CallbackQuery):
     if not base:
         await callback.answer("Модель не найдена", show_alert=True)
         return
+    
     await callback.answer("Ищу...")
     try:
         await callback.message.edit_text("⏳ Ищу ещё...")
     except Exception:
         pass
-    seen = get_manual_seen(gift_id, min_price, max_price)
-    results = await find_market_gifts(gift_id=gift_id, min_price=min_price, max_price=max_price, need=SEARCH_RESULT_LIMIT, skip_slugs=seen)
-    LAST_RESULTS_BY_USER[user_id] = results
-    remember_manual_results(gift_id, min_price, max_price, results)
+    
+    if mode == "parse":
+        seen = get_manual_seen(gift_id, min_price, max_price)
+        results = await find_market_gifts(
+            gift_id=gift_id,
+            min_price=min_price,
+            max_price=max_price,
+            need=SEARCH_RESULT_LIMIT,
+            skip_slugs=seen
+        )
+        remember_manual_results(gift_id, min_price, max_price, results)
+        title = f"🎁 {base.title}"
+    else:
+        if user_id not in USER_NEW_SEEN:
+            USER_NEW_SEEN[user_id] = set()
+        seen = USER_NEW_SEEN[user_id]
+        results = await find_market_gifts(
+            gift_id=gift_id,
+            min_price=min_price,
+            max_price=max_price,
+            need=SEARCH_RESULT_LIMIT,
+            skip_slugs=seen
+        )
+        for gift in results:
+            USER_NEW_SEEN[user_id].add(gift.slug)
+        save_user_new_seen()
+        title = f"🆕 {base.title} (НОВЫЕ)"
+    
     try:
         await callback.message.delete()
     except Exception:
         pass
-    await send_search_results(callback.message, base, results, min_price, max_price)
+    
+    await send_search_results(callback.message, title, results, min_price, max_price, mode)
 
 
-@dp.callback_query(F.data == "clear_seen")
+@dp.callback_query(F.data.startswith("clear_seen:"))
 async def clear_seen(callback: CallbackQuery):
     user_id = callback.from_user.id
     if not is_user_allowed(user_id):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
-    search = LAST_SEARCH_BY_USER.get(user_id)
-    if search:
-        clear_manual_seen(search["gift_id"], search["min_price"], search["max_price"])
-    await callback.answer("История поиска сброшена")
-    await callback.message.edit_text("🧹 История текущего поиска сброшена.", reply_markup=main_menu_keyboard(user_id))
+    
+    mode = callback.data.split(":")[1]
+    search = USER_SEARCH_HISTORY.get(user_id)
+    
+    if mode == "parse":
+        if search:
+            clear_manual_seen(search["gift_id"], search["min_price"], search["max_price"])
+        await callback.answer("🧹 История обычного поиска сброшена")
+    else:
+        if user_id in USER_NEW_SEEN:
+            USER_NEW_SEEN[user_id] = set()
+            save_user_new_seen()
+        await callback.answer("🧹 История новых подарков сброшена")
+    
+    await callback.message.edit_text(
+        "🧹 История поиска сброшена.",
+        reply_markup=main_menu_keyboard(user_id)
+    )
 
 
 @dp.callback_query(F.data.startswith("ban_owner:"))
 async def ban_owner_callback(callback: CallbackQuery):
+    """Бан владельца - МОГУТ ВСЕ"""
     user_id = callback.from_user.id
-    if not is_admin(user_id):
-        await callback.answer("Только для админа", show_alert=True)
+    if not is_user_allowed(user_id):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
+    
     try:
-        idx = int(callback.data.split(":", 1)[1])
+        _, idx_str, mode = callback.data.split(":")
+        idx = int(idx_str)
     except Exception:
-        await callback.answer("Ошибка индекса", show_alert=True)
+        await callback.answer("Ошибка", show_alert=True)
         return
-    results = LAST_RESULTS_BY_USER.get(user_id, [])
+    
+    # Получаем результаты из последнего поиска
+    search = USER_SEARCH_HISTORY.get(user_id)
+    if not search:
+        await callback.answer("Нет результатов", show_alert=True)
+        return
+    
+    # Заново ищем, чтобы получить объекты
+    gift_id = search["gift_id"]
+    min_price = search["min_price"]
+    max_price = search["max_price"]
+    
+    if mode == "parse":
+        seen = get_manual_seen(gift_id, min_price, max_price)
+        results = await find_market_gifts(
+            gift_id=gift_id,
+            min_price=min_price,
+            max_price=max_price,
+            need=SEARCH_RESULT_LIMIT,
+            skip_slugs=seen
+        )
+    else:
+        seen = USER_NEW_SEEN.get(user_id, set())
+        results = await find_market_gifts(
+            gift_id=gift_id,
+            min_price=min_price,
+            max_price=max_price,
+            need=SEARCH_RESULT_LIMIT,
+            skip_slugs=seen
+        )
+    
     if idx < 0 or idx >= len(results):
         await callback.answer("Результат устарел", show_alert=True)
         return
+    
     owner = results[idx].owner
     blacklist_owner(owner)
-    await callback.answer(f"Забанен {owner.display}")
+    await callback.answer(f"✅ Забанен {owner.display}")
 
+
+# ============================================================
+# ЧЁРНЫЙ СПИСОК
+# ============================================================
 
 @dp.callback_query(F.data == "blacklist")
 async def show_blacklist(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Только для админа", show_alert=True)
-        return
+    """Показать чёрный список - видят все"""
     if not OWNERS_BLACKLIST:
         text = "🚫 Чёрный список пуст"
     else:
@@ -1497,21 +1038,24 @@ async def show_blacklist(callback: CallbackQuery):
         for i, (key, label) in enumerate(list(OWNERS_BLACKLIST.items())[:50], 1):
             lines.append(f"{i}. {key} — {label}")
         text = "\n".join(lines)
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🧹 Очистить", callback_data="blacklist_clear")],
-        [InlineKeyboardButton(text="🏠 Главное", callback_data="menu")]
-    ]))
+    
+    keyboard = []
+    if is_admin(callback.from_user.id):
+        keyboard.append([InlineKeyboardButton(text="🧹 Очистить", callback_data="blacklist_clear")])
+    keyboard.append([InlineKeyboardButton(text="🏠 Главное", callback_data="menu")])
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
     await callback.answer()
 
 
 @dp.callback_query(F.data == "blacklist_clear")
 async def clear_blacklist(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
-        await callback.answer("Только для админа", show_alert=True)
+        await callback.answer("⛔ Только для админа", show_alert=True)
         return
     OWNERS_BLACKLIST.clear()
     save_owner_blacklist()
-    await callback.answer("Чёрный список очищен")
+    await callback.answer("🧹 Чёрный список очищен")
     await show_blacklist(callback)
 
 
@@ -1528,13 +1072,11 @@ async def admin_panel(callback: CallbackQuery):
     status = "✅ АКТИВНА" if is_auth else "❌ НЕ АКТИВНА"
     me = await user_client.get_me() if is_auth else None
     account = f"{me.first_name} (@{me.username})" if me else "—"
-    active_monitors = sum(1 for s in USER_MONITOR_SESSIONS.values() if s.active)
     await callback.message.edit_text(
         f"⚙️ АДМИН-ПАНЕЛЬ\n\n"
         f"🔐 Сессия: {status}\n"
         f"👤 Аккаунт: {account}\n"
         f"📦 Моделей: {len(BASE_GIFTS)}\n"
-        f"👥 Активных мониторингов: {active_monitors}\n"
         f"🚫 В черном списке: {len(OWNERS_BLACKLIST)}\n"
         f"👥 Разрешённых юзеров: {len(WHITELIST_USERS)}",
         reply_markup=admin_panel_keyboard()
@@ -1551,14 +1093,11 @@ async def check_session_admin(callback: CallbackQuery):
     if is_auth:
         try:
             me = await user_client.get_me()
-            if me:
-                name = me.first_name or "Пользователь"
-                username = f" (@{me.username})" if me.username else ""
-                await callback.answer(f"✅ Сессия активна\n👤 {name}{username}", show_alert=True)
-            else:
-                await callback.answer("✅ Сессия активна", show_alert=True)
-        except Exception as e:
-            await callback.answer(f"⚠️ Сессия активна, но ошибка: {e}", show_alert=True)
+            name = me.first_name or "Пользователь"
+            username = f" (@{me.username})" if me.username else ""
+            await callback.answer(f"✅ Сессия активна\n👤 {name}{username}", show_alert=True)
+        except Exception:
+            await callback.answer("✅ Сессия активна", show_alert=True)
     else:
         await callback.answer("❌ Сессия не активна!\nИспользуй /add_session", show_alert=True)
     await admin_panel(callback)
@@ -1586,7 +1125,6 @@ async def bot_status_callback(callback: CallbackQuery):
         return
     is_auth = await is_user_client_authorized()
     me = await user_client.get_me() if is_auth else None
-    active_monitors = sum(1 for s in USER_MONITOR_SESSIONS.values() if s.active)
     text = (
         f"📊 СТАТУС БОТА\n\n"
         f"🤖 Бот: @{bot.username}\n"
@@ -1596,7 +1134,6 @@ async def bot_status_callback(callback: CallbackQuery):
         text += f"👤 Аккаунт: {me.first_name} (@{me.username})\n"
     text += (
         f"📦 Моделей: {len(BASE_GIFTS)}\n"
-        f"👥 Активных мониторингов: {active_monitors}\n"
         f"🚫 В черном списке: {len(OWNERS_BLACKLIST)}\n"
         f"👥 Разрешённых юзеров: {len(WHITELIST_USERS)}"
     )
@@ -1605,7 +1142,7 @@ async def bot_status_callback(callback: CallbackQuery):
 
 
 # ============================================================
-# ВЫДАЧА ПРАВ
+# ВЫДАЧА ДОСТУПА
 # ============================================================
 
 @dp.callback_query(F.data == "grant_access_panel")
@@ -1615,14 +1152,10 @@ async def grant_access_panel(callback: CallbackQuery):
         return
     await callback.message.edit_text(
         "👥 УПРАВЛЕНИЕ ДОСТУПОМ\n\n"
-        "Здесь вы можете выдать доступ к функциям бота обычным пользователям.\n"
-        "Для выдачи отправьте команду:\n"
+        "Для выдачи доступа отправьте команду:\n"
         "/grant ID_пользователя\n\n"
         "Например: /grant 123456789\n\n"
-        "Пользователь сможет:\n"
-        "- Искать подарки по моделям\n"
-        "- Использовать мониторинг\n\n"
-        "⚠️ Только для администратора.",
+        "Для отзыва: /revoke ID_пользователя",
         reply_markup=grant_access_keyboard()
     )
     await callback.answer()
@@ -1703,6 +1236,71 @@ async def list_allowed_callback(callback: CallbackQuery):
     await callback.answer()
 
 
+# ============================================================
+# ОБЩИЕ КОМАНДЫ
+# ============================================================
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    user_id = message.from_user.id
+    
+    if not is_user_allowed(user_id):
+        await message.answer(
+            "⛔ У вас нет доступа к этому боту.\n\n"
+            "Для получения доступа обратитесь к администратору: @rozuvu"
+        )
+        return
+    
+    if not await is_user_client_authorized():
+        if is_admin(user_id):
+            await message.answer(
+                "⚠️ Сессия не добавлена!\n\nИспользуй /add_session",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="➕ ДОБАВИТЬ СЕССИЮ", callback_data="add_session_btn")]
+                ])
+            )
+        else:
+            await message.answer("⚠️ Бот настраивается. Подождите.")
+        return
+    
+    await ensure_models_loaded()
+    await message.answer(
+        "🎁 ПАРСЕР ПОДАРКОВ\n\n"
+        "Выбери режим:\n"
+        "📦 ОБЫЧНЫЙ ПАРСИНГ - все подарки на маркете\n"
+        "🆕 НОВЫЕ ПОДАРКИ - только свежие поступления\n\n"
+        "Банить владельцев могут ВСЕ пользователи!",
+        reply_markup=main_menu_keyboard(user_id)
+    )
+
+
+@dp.callback_query(F.data == "menu")
+async def menu(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not is_user_allowed(user_id):
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "🎁 ГЛАВНОЕ МЕНЮ\n\n"
+        "Выбери режим работы:",
+        reply_markup=main_menu_keyboard(user_id)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "reload_models")
+async def reload_models_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Только для админа")
+        return
+    await callback.answer("Обновляю...")
+    await load_base_gifts()
+    await callback.message.edit_text(
+        f"✅ Модели обновлены.\n\n📦 Загружено: {len(BASE_GIFTS)}",
+        reply_markup=main_menu_keyboard(callback.from_user.id)
+    )
+
+
 @dp.message(Command("cancel"))
 async def cancel_command(message: Message, state: FSMContext):
     await state.clear()
@@ -1711,23 +1309,65 @@ async def cancel_command(message: Message, state: FSMContext):
 
 
 # ============================================================
+# МОНИТОРИНГ СЕССИИ
+# ============================================================
+
+async def check_session_and_alert():
+    global session_alert_sent
+    is_auth = await is_user_client_authorized()
+    if not is_auth and not session_alert_sent:
+        session_alert_sent = True
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                "🚨 **СЕССИЯ ТЕЛЕГРАМ ПОТЕРЯНА!**\n\n"
+                "Аккаунт разлогинился.\n"
+                "Восстановите сессию командой /add_session",
+                parse_mode="Markdown"
+            )
+            log.warning("Session loss alert sent to admin")
+        except Exception as e:
+            log.error("Failed to send session alert: %s", e)
+        return False
+    elif is_auth and session_alert_sent:
+        session_alert_sent = False
+        log.info("Session restored, alert flag cleared")
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                "✅ **СЕССИЯ ВОССТАНОВЛЕНА**",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+    return is_auth
+
+
+async def session_monitor():
+    """Фоновый мониторинг сессии"""
+    while True:
+        await asyncio.sleep(60)
+        await check_session_and_alert()
+
+
+# ============================================================
 # ЗАПУСК
 # ============================================================
 
 async def main():
     global SEEN_GIFTS_BY_QUERY, OWNERS_BLACKLIST, OWNER_CACHE
-    global WHITELIST_USERS, USER_MONITOR_SESSIONS
+    global WHITELIST_USERS, USER_NEW_SEEN
 
     SEEN_GIFTS_BY_QUERY = load_seen_manual()
     OWNERS_BLACKLIST = load_owner_blacklist()
     OWNER_CACHE = load_owner_cache()
     WHITELIST_USERS = load_whitelist()
-    USER_MONITOR_SESSIONS = load_user_monitor_sessions()
+    USER_NEW_SEEN = load_user_new_seen()
 
     log.info(
-        "Loaded: manual_queries=%s | blacklist=%s | whitelist=%s | monitor_sessions=%s",
+        "Loaded: manual_queries=%s | blacklist=%s | whitelist=%s | user_new_seen=%s",
         len(SEEN_GIFTS_BY_QUERY), len(OWNERS_BLACKLIST),
-        len(WHITELIST_USERS), len(USER_MONITOR_SESSIONS)
+        len(WHITELIST_USERS), len(USER_NEW_SEEN)
     )
 
     await ensure_user_client_connected()
@@ -1749,7 +1389,10 @@ async def main():
                 parse_mode="Markdown"
             )
         except Exception as e:
-            log.error("Failed to send initial session alert: %s", e)
+            log.error("Failed to send session alert: %s", e)
+
+    # Запускаем мониторинг сессии
+    asyncio.create_task(session_monitor())
 
     log.info("Bot polling started")
     await dp.start_polling(bot)
