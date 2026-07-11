@@ -71,7 +71,7 @@ USER_SELECTED_GIFT: Dict[int, int] = {}
 OWNERS_BLACKLIST: Dict[str, str] = {}
 SEEN_GIFTS_BY_QUERY: Dict[str, List[str]] = {}
 OWNER_CACHE: Dict[int, "OwnerInfo"] = {}
-USER_NEW_SEEN: Dict[int, Set[str]] = {}  # Для режима "Новые подарки"
+USER_NEW_SEEN: Dict[int, Set[str]] = {}
 USER_SEARCH_HISTORY: Dict[int, Dict] = {}
 
 session_alert_sent = False
@@ -1071,6 +1071,7 @@ async def bot_status_callback(callback: CallbackQuery):
 async def cmd_start(message: Message):
     user_id = message.from_user.id
     
+    # Проверка сессии
     if not await is_user_client_authorized():
         if is_admin(user_id):
             await message.answer(
@@ -1083,7 +1084,10 @@ async def cmd_start(message: Message):
             await message.answer("⚠️ Бот настраивается. Подождите.")
         return
     
+    # Загружаем модели
     await ensure_models_loaded()
+    
+    # Отправляем главное меню
     await message.answer(
         "🎁 ПАРСЕР ПОДАРКОВ\n\n"
         "Выбери режим:\n"
